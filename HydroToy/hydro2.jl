@@ -457,37 +457,8 @@ function compare_methods(problem::HydroProblem)
 end
 
 """
-Create a reproducible baseline case for method-to-method comparisons.
-
-The baseline is intentionally small and stable so that EV/LDR/SAA outputs can
-be compared across commits without changing input data.
+A small hydro thermal problem roughly in the Brazilian scale.
 """
-function build_baseline_problem()
-    hydro_generation = 5.0
-    hydro_capacity = 100.0
-    termo_generations = [20.0, 20.0, 20.0]
-    termo_costs = [10.0, 20.0, 30.0]
-    stage_demands = [30.0, 30.0]
-    initial_volume = 50.0
-    initial_inflow = 10.0
-    inflow_distr = Uniform(5.0, 15.0)
-    cuts_coeff = [0.0, 0.1]
-    cuts_inter = [0.0, 1.0]
-
-    return HydroProblem(
-        hydro_generation,
-        hydro_capacity,
-        termo_generations,
-        termo_costs,
-        stage_demands,
-        initial_volume,
-        initial_inflow,
-        inflow_distr,
-        cuts_coeff,
-        cuts_inter,
-    )
-end
-
 function build_toy_problem()
     h_generation = 100.
     h_capacity = 300.
@@ -496,7 +467,6 @@ function build_toy_problem()
     stage_demands = [70., 70.]
     initial_vol = 100.
     initial_inflow = 60.
-    #inflow_distr = Normal(60., 20.)
     inflow_distr = truncated(Normal(60., 20.), 0., 120)
     cuts_coeff = [-300., -600., -1200., -2500., -7800.]
     cuts_inter = [75000., 135000., 210000., 310000., 390000.]
