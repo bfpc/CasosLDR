@@ -1,3 +1,5 @@
+module HydroToy2
+
 using Random
 using Printf
 
@@ -490,6 +492,8 @@ function main()
     compare_methods(toy)
 end
 
+end # module
+
 if abspath(PROGRAM_FILE) == @__FILE__
-    main()
+    HydroToy2.main()
 end
