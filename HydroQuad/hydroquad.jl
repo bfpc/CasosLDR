@@ -156,9 +156,11 @@ function expected_value_solution(problem::HydroProblem)
     inflows = [problem.initial_inflow, mean(problem.inflow_distr)]
     cost_coeffs = problem.termo_cost_coeffs
     
-    ev = Model(Ipopt.Optimizer)
+    ev = Model(HiGHS.Optimizer)
     set_silent(ev)
-    set_attribute(ev, "max_wall_time", 60.)
+    set_attribute(ev, "solver", "ipm")
+    set_attribute(ev, "time_limit", 60.)
+    # set_attribute(ev, "max_wall_time", 60.)
     
     @variables(ev, begin
         0 <= hydro[1:2] <= problem.hydro_generation
@@ -197,8 +199,10 @@ function ldr_solution(problem::HydroProblem, n_breakpoints=0)
     cost_coeffs = problem.termo_cost_coeffs
     
     ldr = LinearDecisionRules.LDRModel(optimizer_with_attributes(
-        Ipopt.Optimizer,
-        "max_wall_time" => 60.,
+        HiGHS.Optimizer,
+        "solver" => "ipm",
+        "time_limit" => 60.,
+        # "max_wall_time" => 60.,
     ))
     #set_silent(ldr)
     
@@ -258,9 +262,11 @@ function saa_solution(problem::HydroProblem, n_samples::Int)
     inflows = rand(problem.inflow_distr, n_samples)
     cost_coeffs = problem.termo_cost_coeffs
 
-    saa = Model(Ipopt.Optimizer)
+    saa = Model(HiGHS.Optimizer)
     #set_silent(saa)
-    set_attribute(saa, "max_wall_time", 60.)
+    set_attribute(saa, "solver", "ipm")
+    set_attribute(saa, "time_limit", 60.)
+    # set_attribute(saa, "max_wall_time", 60.)
     
     @variables(saa, begin
         0 <= hydro₁ <= problem.hydro_generation
