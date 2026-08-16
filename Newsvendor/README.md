@@ -4,12 +4,25 @@ This directory contains a simple implementation of the newsvendor problem, which
 
 It is formulated as
 $$ \begin{array}{rll}
-\max & \mathbb{E}\left[ p \min(x, d) + r \max(0, x - d) - c x \right] \\
-\text{s.t.} & x \geq 0,
+\max & \mathbb{E}\left[ p \cdot \mathrm{sell} + r \cdot \mathrm{ret} - c \cdot \mathrm{buy} \right] \\
+\text{s.t.}
+& \mathrm{sell} + \mathrm{ret} \leq \mathrm{buy}, \\
+& \mathrm{sell} \leq d, \\
+& \mathrm{buy}, \mathrm{sell}, \mathrm{ret} \geq 0;
 \end{array} $$
-where $x$ is the order quantity, $d$ is the random demand, $p$ is the selling price, $c$ is the purchase cost, and $r$ is the salvage value.
+where $\mathrm{buy}$ is the order quantity, $\mathrm{sell}$ is the quantity sold and $\mathrm{ret}$ is the quantity returned.
+The parameters for the problem are:
+* $d$, the random demand,
+* $p$, the selling price,
+* $c$, the purchase cost, and
+* $r$, the salvage value.
+
 
 ## newsvendor.jl
 
-This file implements the newsvendor problem, and compares the expected value (EV) solution (a deterministic problem) with the Sample Average Approximation (SAA) solution for different numbers of scenarios and the Linear Decision Rules solution with different number of breakpoints.
+This file implements three models for the newsvendor problem, comparing:
+1. the expected value (EV) solution (a deterministic formulation), with
+2. the Sample Average Approximation (SAA) solution for different numbers of scenarios, and
+3. the Linear Decision Rule (LDR) solution with different number of breakpoints.
+
 We consider two parameter choices for $(p, r, c)$, which yield different _a posteriori_ relative performances of the EV and LDR solutions. The SAA solution is expected to converge to the true optimal solution as the number of scenarios increases, while the LDR solution is expected to improve as the number of breakpoints increases.
