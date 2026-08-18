@@ -2,7 +2,9 @@
 
 This directory contains variations on a toy hydrothermal dispatch problem.
 It is formulated as
-$$ \begin{array}{rll}
+
+$$
+\begin{array}{rll}
 \min & \mathbb{E}\left[\sum_{t=1}^{T} \sum_{i=1}^{N} c_i p_{i,t} + V(v_t) \right] \\
 \text{s.t.} & v_{t} = v_{t-1} + a_t(\xi_t) - gh_t - s_t, & \text{water balance} \\
 & gh_t + \sum_{i=1}^{N} p_{i,t} = D_t, & \text{demand satisfaction} \\
@@ -10,7 +12,9 @@ $$ \begin{array}{rll}
 & 0 \leq v_t \leq v_{\max}, \\
 & 0 \leq gh_t \leq gh_{\max}, \\
 & 0 \leq s_t.
-\end{array} $$
+\end{array}
+$$
+
 There, $v_t$ represents stored volume, $gh_t$ is the hydro generation, $s_t$ is spillage, and $p_{i,t}$ is the thermal generation of unit $i$; all for each time step $t$.
 The inflow $a_t(\xi_t)$ is a random variable that depends on the scenario $\xi_t$, and $D_t$ is the demand at time $t$. The objective is to minimize the expected cost of thermal generation over the planning horizon, plus a terminal value function $V$ for the final stored volume.
 
