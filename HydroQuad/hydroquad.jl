@@ -341,7 +341,9 @@ function compare_methods(problem::HydroProblem)
     end
 
     # --- EV ---
+    print("Solving EV model...")
     ev_dt, ev_obj, ev_hydro₁, ev_vol₁, ev_termo₁ = expected_value_solution(problem)
+    print(" evaluating policy...")
     ev_fst, ev_std, ev_hydro₂, ev_vol₂, ev_termo₂ = evaluate_firststage(problem, ev_vol₁, scenarios_count)
     ev_perf = ev_fst + quad_cost(ev_termo₁)
     push!(results,
@@ -360,11 +362,15 @@ function compare_methods(problem::HydroProblem)
               ev_dt
           )
     )
+    println(" done.")
 
     # --- LDR with different numbers of breakpoints ---
+    print("Solving LDR models...")
     for n_breakpoints in 0:3
+        print(" $n_breakpoints ...")
         ldr_dt, ldr_p_obj, ldr_d_obj, ldr_hydro₁, ldr_vol₁, ldr_termo₁ =
             ldr_solution(problem, n_breakpoints)
+        print(" evaluating policy...")
         ldr_fst, ldr_std, ldr_hydro₂, ldr_vol₂, ldr_termo₂ = evaluate_firststage(problem, ldr_vol₁, scenarios_count)
         ldr_perf = ldr_fst + quad_cost(ldr_termo₁)
         push!(
@@ -385,9 +391,12 @@ function compare_methods(problem::HydroProblem)
             ),
         )
     end
+    println(" done.")
 
     # --- SAA with multiple sample sizes ---
+    print("Solving SAA models...")
     for N_samples in repeat([4, 10, 30, 100]; inner = 3)
+        print(" $N_samples,")
         saa_dt, saa_obj, saa_hydro₁, saa_vol₁, saa_termo₁ = saa_solution(problem, N_samples)
         saa_fst, saa_std, saa_hydro₂, saa_vol₂, saa_termo₂ = evaluate_firststage(problem, saa_vol₁, scenarios_count)
         saa_perf = saa_fst +  quad_cost(saa_termo₁)
@@ -409,6 +418,7 @@ function compare_methods(problem::HydroProblem)
             ),
         )
     end
+    println(" done.")
 
     # --- Print table ---
     header = @sprintf(
@@ -429,7 +439,7 @@ function compare_methods(problem::HydroProblem)
     return results
 end
 
-function main()
+function build_toy_problem()
     h_generation = 100.
     h_capacity = 300.
     t_generation = 20.
@@ -441,7 +451,8 @@ function main()
     cuts_coeff = [-300., -600., -1200., -2500., -7800.]
     cuts_inter = [75000., 135000., 210000., 310000., 390000.]
     t_cost_coeffs = [121.30*0.51^2/2, 0., 0.]
-    toy = HydroProblem(
+
+    return HydroProblem(
         h_generation,
         h_capacity,
         t_generation,
@@ -453,7 +464,10 @@ function main()
         cuts_coeff,
         cuts_inter
     )
+end
 
+function main()
+    toy = build_toy_problem()
     compare_methods(toy)
 end
 
