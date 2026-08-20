@@ -10,6 +10,7 @@ using Distributions
 using LinearDecisionRules
 
 using Main.Compare
+default_solver = optimizer_with_attributes(HiGHS.Optimizer, "solver" => "ipm")
 
 # Two-stage hydro-thermal toy model:
 # - Stage 1 inflow is deterministic (initial_inflow).
@@ -33,6 +34,7 @@ struct HydroProblem
     cuts_count::Int
     cuts_coeff::Vector{Float64}
     cuts_inter::Vector{Float64}
+    solver::Any
     second_stage::Ref{Union{Nothing, Model}}
     ext::Dict{Symbol, Any}
 
@@ -46,7 +48,8 @@ struct HydroProblem
         initial_inflow::Float64,
         inflow_distr::Distribution,
         cuts_coeff::Vector{Float64},
-        cuts_inter::Vector{Float64}
+        cuts_inter::Vector{Float64},
+        solver = default_solver
     )
         if hydro_generation <= 0 || hydro_capacity <= 0
             error("Hydro parameters must be positive values")
@@ -86,6 +89,7 @@ struct HydroProblem
             cuts_count,
             cuts_coeff,
             cuts_inter,
+            solver,
             Ref{Union{Nothing, Model}}(nothing),
             Dict{Symbol, Any}(),
         )
@@ -183,7 +187,7 @@ Deterministic expected-value approximation:
 function expected_value_solution(problem::HydroProblem)
     inflows = [problem.initial_inflow, mean(problem.inflow_distr)]
 
-    ev = Model(HiGHS.Optimizer)
+    ev = Model(problem.solver)
     set_silent(ev)
 
     @variable(ev, hydro[1:2] >= 0)
@@ -222,7 +226,7 @@ end
 LDR model where stage-2 decisions depend on stochastic inflow.
 """
 function ldr_solution(problem::HydroProblem, n_breakpoints=0)
-    ldr = LinearDecisionRules.LDRModel(HiGHS.Optimizer)
+    ldr = LinearDecisionRules.LDRModel(problem.solver)
     set_silent(ldr)
 
     @variable(ldr, hydro₁ >= 0, LinearDecisionRules.FirstStage)
@@ -294,7 +298,7 @@ function saa_solution(problem::HydroProblem, n_samples::Int)
     cuts_count = problem.cuts_count
     inflows = rand(problem.inflow_distr, n_samples)
 
-    saa = Model(HiGHS.Optimizer)
+    saa = Model(problem.solver)
     set_silent(saa)
 
     @variable(saa, hydro₁ >= 0)
@@ -362,7 +366,7 @@ end
 """
 A small hydro thermal problem roughly in the Brazilian scale.
 """
-function build_toy_problem()
+function build_toy_problem(solver = default_solver)
     h_generation = 100.
     h_capacity = 300.
     t_generations = [10., 5., 5.]
@@ -384,12 +388,13 @@ function build_toy_problem()
         initial_inflow,
         inflow_distr,
         cuts_coeff,
-        cuts_inter
+        cuts_inter,
+        solver
     )
 end
 
-function main()
-    toy = build_toy_problem()
+function main(solver = default_solver)
+    toy = build_toy_problem(solver)
     compare_methods(toy)
 end
 

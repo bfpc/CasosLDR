@@ -5,7 +5,7 @@ module HydroQuad
 using Random
 
 using JuMP
-using HiGHS, Ipopt
+using HiGHS
 using Distributions
 using LinearDecisionRules
 
@@ -16,6 +16,7 @@ using Main.Compare
 #
 # Every solution method returns a NamedTuple `(; Obj, Bound, H₁, V₁, T₁, dt)`,
 # which `Compare.run_comparison` times, evaluates and tabulates.
+default_solver = optimizer_with_attributes(HiGHS.Optimizer, "solver" => "ipm")
 
 struct HydroProblem
     hydro_generation::Float64
@@ -29,6 +30,7 @@ struct HydroProblem
     cuts_count::Int
     cuts_coeff::Vector{Float64}
     cuts_inter::Vector{Float64}
+    solver::Any
     second_stage::Ref{Union{Nothing, Model}}
     ext::Dict{Symbol, Any}
 
@@ -42,7 +44,8 @@ struct HydroProblem
         initial_inflow::Float64,
         inflow_distr::Distribution,
         cuts_coeff::Vector{Float64},
-        cuts_inter::Vector{Float64}
+        cuts_inter::Vector{Float64},
+        solver = default_solver
     )
         if hydro_generation <= 0 || hydro_capacity <= 0
             error("Hydro parameters must be positive values")
@@ -80,6 +83,7 @@ struct HydroProblem
             cuts_count,
             cuts_coeff,
             cuts_inter,
+            solver,
             Ref{Union{Nothing, Model}}(nothing),
             Dict{Symbol, Any}(),
         )
@@ -167,11 +171,8 @@ end
 function expected_value_solution(problem::HydroProblem)
     inflows = [problem.initial_inflow, mean(problem.inflow_distr)]
 
-    ev = Model(HiGHS.Optimizer)
+    ev = Model(problem.solver)
     set_silent(ev)
-    set_attribute(ev, "solver", "ipm")
-    set_attribute(ev, "time_limit", 60.)
-    # set_attribute(ev, "max_wall_time", 60.)
 
     @variables(ev, begin
         0 <= hydro[1:2] <= problem.hydro_generation
@@ -210,12 +211,7 @@ function expected_value_solution(problem::HydroProblem)
 end
 
 function ldr_solution(problem::HydroProblem, n_breakpoints=0)
-    ldr = LinearDecisionRules.LDRModel(optimizer_with_attributes(
-        HiGHS.Optimizer,
-        "solver" => "ipm",
-        "time_limit" => 60.,
-        # "max_wall_time" => 60.,
-    ))
+    ldr = LinearDecisionRules.LDRModel(problem.solver)
     set_silent(ldr)
 
     @variable(ldr, inflow in
@@ -275,11 +271,8 @@ function saa_solution(problem::HydroProblem, n_samples::Int)
     cuts_count = problem.cuts_count
     inflows = rand(problem.inflow_distr, n_samples)
 
-    saa = Model(HiGHS.Optimizer)
+    saa = Model(problem.solver)
     set_silent(saa)
-    set_attribute(saa, "solver", "ipm")
-    set_attribute(saa, "time_limit", 60.)
-    # set_attribute(saa, "max_wall_time", 60.)
 
     @variables(saa, begin
         0 <= hydro₁ <= problem.hydro_generation
@@ -342,7 +335,7 @@ function compare_methods(problem::HydroProblem)
     return run_comparison(problem, solvers; evaluate = evaluate_policy)
 end
 
-function build_toy_problem()
+function build_toy_problem(solver = default_solver)
     h_generation = 100.
     h_capacity = 300.
     t_generation = 20.
@@ -364,12 +357,13 @@ function build_toy_problem()
         initial_inflow,
         inflow_distr,
         cuts_coeff,
-        cuts_inter
+        cuts_inter,
+        solver
     )
 end
 
-function main()
-    toy = build_toy_problem()
+function main(solver = default_solver)
+    toy = build_toy_problem(solver)
     compare_methods(toy)
 end
 

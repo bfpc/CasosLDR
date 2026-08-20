@@ -10,18 +10,21 @@ using Distributions
 using LinearDecisionRules
 
 using Main.Compare
+default_solver = HiGHS.Optimizer
 
 struct NewsvendorProblem
     buy_cost::Float64
     return_value::Float64
     sell_value::Float64
     demand_distr::Distribution
+    solver::Any
 
     function NewsvendorProblem(
         buy_cost::Float64,
         return_value::Float64,
         sell_value::Float64,
         demand_distr::Distribution,
+        solver = default_solver
     )
         if sell_value < buy_cost
             error("Sell value must be at least as large as buy cost.")
@@ -29,7 +32,7 @@ struct NewsvendorProblem
         if return_value > buy_cost
             error("Return value cannot exceed buy cost.")
         end
-        return new(buy_cost, return_value, sell_value, demand_distr)
+        return new(buy_cost, return_value, sell_value, demand_distr, solver)
     end
 end
 
@@ -69,7 +72,7 @@ end
 function expected_value_solution(problem::NewsvendorProblem)
     E_demand = mean(problem.demand_distr)
 
-    ev = Model(HiGHS.Optimizer)
+    ev = Model(problem.solver)
     set_silent(ev)
 
     @variable(ev, buy >= 0)
@@ -94,7 +97,7 @@ end
 
 # LDR solution, with optional breakpoints for piecewise linear decision rules
 function ldr_solution(problem::NewsvendorProblem; n_breakpoints = 0)
-    ldr = LinearDecisionRules.LDRModel(HiGHS.Optimizer)
+    ldr = LinearDecisionRules.LDRModel(problem.solver)
     set_silent(ldr)
 
     @variable(ldr, buy >= 0, LinearDecisionRules.FirstStage)
@@ -134,7 +137,7 @@ end
 
 # SAA solution with `N_samples` demand scenarios
 function saa_solution(problem::NewsvendorProblem, N_samples)
-    saa = Model(HiGHS.Optimizer)
+    saa = Model(problem.solver)
     set_silent(saa)
 
     @variable(saa, buy >= 0)
@@ -173,13 +176,14 @@ function compare_methods(problem::NewsvendorProblem)
     return run_comparison(problem, solvers; evaluate = evaluate_policy, verbose = false)
 end
 
-function main()
+function main(solver = default_solver)
     # LDR loses to EV in re-optimization
     problem1 = NewsvendorProblem(
         10.0, # buy_cost
         8.0,  # return_value
         15.0, # sell_value
         Uniform(80, 120), # demand_distr
+        solver,
     )
     compare_methods(problem1)
 
@@ -191,6 +195,7 @@ function main()
         8.0,  # return_value
         20.0, # sell_value
         Uniform(80, 120), # demand_distr
+        solver,
     )
     compare_methods(problem2)
 
