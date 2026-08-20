@@ -204,7 +204,7 @@ function ldr_solution(problem::HydroProblem, n_breakpoints=0)
         "time_limit" => 60.,
         # "max_wall_time" => 60.,
     ))
-    #set_silent(ldr)
+    set_silent(ldr)
     
     @variable(ldr, inflow in
              LinearDecisionRules.Uncertainty(; distribution = problem.inflow_distr))
@@ -263,7 +263,7 @@ function saa_solution(problem::HydroProblem, n_samples::Int)
     cost_coeffs = problem.termo_cost_coeffs
 
     saa = Model(HiGHS.Optimizer)
-    #set_silent(saa)
+    set_silent(saa)
     set_attribute(saa, "solver", "ipm")
     set_attribute(saa, "time_limit", 60.)
     # set_attribute(saa, "max_wall_time", 60.)
