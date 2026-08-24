@@ -1,12 +1,15 @@
+isdefined(Main, :Compare) || include(joinpath(@__DIR__, "..", "src", "Compare.jl"))
+
 module Newsvendor
 
 using Random
-using Printf
 
 using JuMP
 using HiGHS
 using Distributions
 using LinearDecisionRules
+
+using Main.Compare
 
 struct NewsvendorProblem
     buy_cost::Float64
@@ -30,15 +33,6 @@ struct NewsvendorProblem
     end
 end
 
-struct TestResult
-    method::String
-    obj::Float64
-    buy::Float64
-    perf::Float64
-    bound::Float64
-    time::Float64
-end
-
 # Analytical expected profit for a given first-stage order quantity `x`
 function evaluate_firststage(problem::NewsvendorProblem, x)
     distr = problem.demand_distr
@@ -53,19 +47,22 @@ end
 function evaluate_firststage(problem::NewsvendorProblem, x, N_samples)
     demands = rand(problem.demand_distr, N_samples)
 
-    total_profit = 0.0
-    for d in demands
+    average, _ = average_scenarios(demands) do d
         sell = min(x, d)
         ret = max(0, x - sell)
         profit =
             -problem.buy_cost * x +
             problem.return_value * ret +
             problem.sell_value * sell
-        total_profit += profit
+        return (; profit)
     end
 
-    expected_profit = total_profit / N_samples
-    return expected_profit
+    return average.profit
+end
+
+# Out-of-sample assessment of the first-stage order quantity of a solution
+function evaluate_policy(problem::NewsvendorProblem, sol)
+    return (; Perf = evaluate_firststage(problem, sol.Buy))
 end
 
 # Deterministic problem, using expected demand
@@ -91,10 +88,8 @@ function expected_value_solution(problem::NewsvendorProblem)
     )
 
     dt = @elapsed optimize!(ev)
-    ev_obj = objective_value(ev)
-    ev_buy = value(buy)
 
-    return dt, ev_obj, ev_buy
+    return (; Obj = objective_value(ev), Bound = +Inf, Buy = value(buy), dt)
 end
 
 # LDR solution, with optional breakpoints for piecewise linear decision rules
@@ -128,11 +123,13 @@ function ldr_solution(problem::NewsvendorProblem; n_breakpoints = 0)
     end
 
     dt = @elapsed optimize!(ldr)
-    ldr_p_obj = objective_value(ldr)
-    ldr_d_obj = objective_value(ldr; dual = true)
-    ldr_buy = LinearDecisionRules.get_decision(ldr, buy)
 
-    return dt, ldr_p_obj, ldr_buy, ldr_d_obj
+    return (;
+        Obj = objective_value(ldr),
+        Bound = objective_value(ldr; dual = true),
+        Buy = LinearDecisionRules.get_decision(ldr, buy),
+        dt,
+    )
 end
 
 # SAA solution with `N_samples` demand scenarios
@@ -161,78 +158,19 @@ function saa_solution(problem::NewsvendorProblem, N_samples)
     )
 
     dt = @elapsed optimize!(saa)
-    saa_obj = objective_value(saa)
-    saa_buy = value(buy)
 
-    return dt, saa_obj, saa_buy
+    return (; Obj = objective_value(saa), Bound = +Inf, Buy = value(buy), dt)
 end
 
-
 function compare_methods(problem::NewsvendorProblem)
-    results = TestResult[]
-    # Solve expected value SAA problem
-    ev_dt, ev_obj, ev_buy = expected_value_solution(problem)
-    ev_perf = evaluate_firststage(problem, ev_buy)
-    push!(results, TestResult("EV", ev_obj, ev_buy, ev_perf, +Inf, ev_dt))
+    solvers = [
+        "EV" => expected_value_solution
+        ["LDR ($n breakpoints)" => p -> ldr_solution(p; n_breakpoints = n) for n in 0:3]
+        ["SAA ($n samples)" => p -> saa_solution(p, n) for
+         n in repeat([4, 10, 30, 100]; inner = 3)]
+    ]
 
-    # LDR / PWLDR with different numbers of breakpoints
-    for n_breakpoints in 0:3
-        ldr_dt, ldr_p_obj, ldr_buy, ldr_d_obj =
-            ldr_solution(problem; n_breakpoints = n_breakpoints)
-        ldr_perf = evaluate_firststage(problem, ldr_buy)
-        push!(
-            results,
-            TestResult(
-                "LDR ($n_breakpoints breakpoints)",
-                ldr_p_obj,
-                ldr_buy,
-                ldr_perf,
-                ldr_d_obj,
-                ldr_dt,
-            ),
-        )
-    end
-
-    # SAA problems
-    for N_samples in repeat([4, 10, 30, 100]; inner = 3)
-        saa_dt, saa_obj, saa_buy = saa_solution(problem, N_samples)
-        saa_perf = evaluate_firststage(problem, saa_buy)
-        push!(
-            results,
-            TestResult(
-                "SAA ($N_samples samples)",
-                saa_obj,
-                saa_buy,
-                saa_perf,
-                +Inf,
-                saa_dt,
-            ),
-        )
-    end
-
-    # Print results
-    # Use Printf for decent formatting
-    @printf(
-        "%-25s & %10s & %10s & %10s & %10s & %10s\n",
-        "Method",
-        "Obj",
-        "Buy",
-        "Perf",
-        "Bound",
-        "Time (ms)"
-    )
-    for res in results
-        @printf(
-            "%-25s & %10.2f & %10.2f & %10.2f & %10.2f & %10.2f\n",
-            res.method,
-            res.obj,
-            res.buy,
-            res.perf,
-            res.bound,
-            1000 * res.time
-        )
-    end
-    return
+    return run_comparison(problem, solvers; evaluate = evaluate_policy, verbose = false)
 end
 
 function main()

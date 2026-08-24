@@ -1,3 +1,5 @@
+include("src/Compare.jl")
+
 include("Newsvendor/newsvendor.jl")
 include("HydroToy/hydro2.jl")
 include("HydroToy/hydro3.jl")

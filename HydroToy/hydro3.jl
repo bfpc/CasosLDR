@@ -1,7 +1,8 @@
+isdefined(Main, :Compare) || include(joinpath(@__DIR__, "..", "src", "Compare.jl"))
+
 module HydroToy3
 
 using Random
-using Printf
 
 using JuMP
 using HiGHS
@@ -9,11 +10,16 @@ using Distributions
 using LinearDecisionRules
 import SDDP
 
+using Main.Compare
+
 # 3-stage hydro-thermal toy model:
 # - Stage 1 inflow is deterministic (initial_inflow).
 # - Stages 2 and 3 inflow is stochastic (inflow_distr).
 # - Demand must be fully met at each stage.
 # - Future cost is represented by piecewise-linear cuts on final storage.
+#
+# Every solution method returns a NamedTuple `(; Obj, Bound, H₁, V₁, T₁, dt)`,
+# which `Compare.run_comparison` times, evaluates and tabulates.
 
 struct HydroProblem
     hydro_generation::Float64
@@ -88,7 +94,7 @@ struct HydroProblem
 end
 
 """
-Evaluate second-stage recourse cost for out-of-sample policy assessment.
+Evaluate second- and third-stage recourse cost for out-of-sample policy assessment.
 
 Inputs:
 - problem: HydroProblem instance
@@ -99,20 +105,16 @@ Inputs:
 Returns:
 - NamedTuple with solver status and all relevant stage-2 outputs.
 """
-function evaluate_firststage(
+function recourse_solution(
     problem::HydroProblem,
     volume_stage2_in::Real,
     inflow_stage2::Real;
     stage3_inflows::Vector{Float64} = rand(problem.inflow_distr, 100)
 )
-
-    Nscen = length(stage3_inflows)
-    if problem.second_stage[] !== nothing
-        recourse = problem.second_stage[]
-        Nscen = recourse.ext[:Nscen]
-    else
-        termo_count = length(problem.termo_costs)
-        cuts_count = length(problem.cuts_coeff)
+    recourse = cached_model(problem) do
+        Nscen = length(stage3_inflows)
+        termo_count = problem.termo_count
+        cuts_count = problem.cuts_count
 
         recourse = Model(HiGHS.Optimizer)
         set_silent(recourse)
@@ -152,7 +154,7 @@ function evaluate_firststage(
         )
 
         recourse.ext[:Nscen] = Nscen
-        problem.second_stage[] = recourse
+        return recourse
     end
 
     fix(recourse[:volume₁], volume_stage2_in)
@@ -169,34 +171,34 @@ function evaluate_firststage(
     )
 end
 
-function evaluate_firststage(problem::HydroProblem, volume₁::Float64, N_samples::Int; seed=0)
-    rng = MersenneTwister(seed)
-    inflows = rand(rng, problem.inflow_distr, N_samples)
+"First-stage thermal cost of a solution."
+function firststage_cost(problem::HydroProblem, sol)
+    return sum(problem.termo_costs[i] * sol.T₁[i] for i in 1:problem.termo_count)
+end
 
-    costs = zeros(N_samples)
-    hydro₂ = zeros(N_samples)
-    volume₂ = zeros(N_samples)
-    thermal₂ = zeros(N_samples, problem.termo_count)
-    for s in 1:N_samples
-        res = evaluate_firststage(problem, volume₁, inflows[s])
-        costs[s] = res.objective
-        hydro₂[s] = res.hydro
-        volume₂[s] = res.volume_final
-        thermal₂[s,:] = res.thermal
-    end
+"""
+Out-of-sample assessment of a solution: average the recourse cost over
+`n_scenarios` sampled inflows and add the first-stage cost it commits to.
+"""
+function evaluate_policy(problem::HydroProblem, sol; n_scenarios = 1000, seed = 0)
+    inflows = rand(MersenneTwister(seed), problem.inflow_distr, n_scenarios)
 
-    fs_obj = mean(costs)
-    fs_std = std(costs)/sqrt(N_samples)
-    fs_hydro = sum(hydro₂)/N_samples
-    fs_vol = sum(volume₂)/N_samples
-    fs_termos = sum(thermal₂, dims=1)/N_samples
-    return fs_obj, fs_std, fs_hydro, fs_vol, fs_termos
+    average, stderror =
+        average_scenarios(inflow -> recourse_solution(problem, sol.V₁, inflow), inflows)
+
+    return (;
+        H₂ = average.hydro,
+        V₂ = average.volume_final,
+        T₂ = average.thermal,
+        Perf = average.objective + firststage_cost(problem, sol),
+        Std = stderror.objective,
+    )
 end
 
 """
 Deterministic expected-value approximation:
-- Replaces stochastic stage-2 inflow by its mean.
-- Solves a two-stage deterministic JuMP model.
+- Replaces stochastic stage-2 and stage-3 inflows by their mean.
+- Solves a three-stage deterministic JuMP model.
 """
 function expected_value_solution(problem::HydroProblem)
     inflows = [problem.initial_inflow, mean(problem.inflow_distr), mean(problem.inflow_distr)]
@@ -222,16 +224,19 @@ function expected_value_solution(problem::HydroProblem)
                sum(problem.termo_costs[i] * sum(termos[:,i]) for i in 1:problem.termo_count) + θ)
 
     dt = @elapsed optimize!(ev)
-    ev_obj = objective_value(ev)
-    ev_hydro₁ = value(hydro[1])
-    ev_vol₁ = value(volume[1])
-    ev_termos₁ = value(termos[1, :])
 
-    return dt, ev_obj, ev_hydro₁, ev_vol₁, ev_termos₁
+    return (;
+        Obj = objective_value(ev),
+        Bound = -Inf,
+        H₁ = value(hydro[1]),
+        V₁ = value(volume[1]),
+        T₁ = value.(termos[1, :]),
+        dt,
+    )
 end
 
 """
-LDR model where stage-2 decisions depend on stochastic inflow.
+LDR model where stage-2 and stage-3 decisions depend on the stochastic inflows.
 """
 function ldr_solution(problem::HydroProblem, n_breakpoints=0)
     ldr = LinearDecisionRules.LDRModel(HiGHS.Optimizer)
@@ -286,16 +291,17 @@ function ldr_solution(problem::HydroProblem, n_breakpoints=0)
     end
 
     dt = @elapsed optimize!(ldr)
-    ldr_p_obj = objective_value(ldr)
-    ldr_d_obj = objective_value(ldr; dual = true)
-    ldr_hydro₁ = LinearDecisionRules.get_decision(ldr, hydro[1])
-    ldr_vol₁ = LinearDecisionRules.get_decision(ldr, volume[1])
 
-    ldr_termos₁ = [
-        LinearDecisionRules.get_decision(ldr, termos[1,i]) for i in 1:problem.termo_count
-    ]
-
-    return dt, ldr_p_obj, ldr_d_obj, ldr_hydro₁, ldr_vol₁, ldr_termos₁
+    return (;
+        Obj = objective_value(ldr),
+        Bound = objective_value(ldr; dual = true),
+        H₁ = LinearDecisionRules.get_decision(ldr, hydro[1]),
+        V₁ = LinearDecisionRules.get_decision(ldr, volume[1]),
+        T₁ = [
+            LinearDecisionRules.get_decision(ldr, termos[1,i]) for i in 1:problem.termo_count
+        ],
+        dt,
+    )
 end
 
 
@@ -303,10 +309,7 @@ end
 Sample Average Approximation (SAA) for a 3-stage hydro-thermal model.
 
 - Inflows for stages 2 and 3 are sampled from problem.inflow_distr.
-- Objective uses the sample average of  thermal costs and future cost.
-
-Returns:
-- objective value and first-stage decisions.
+- Objective uses the sample average of thermal costs and future cost.
 """
 function saa_solution(problem::HydroProblem, n_samples2::Int, n_samples3::Int = 30)
     if n_samples2 <= 0 || n_samples3 <= 0
@@ -330,12 +333,12 @@ function saa_solution(problem::HydroProblem, n_samples2::Int, n_samples3::Int = 
     @variable(saa, 0 <= hydro₂[1:n_samples2] <= problem.hydro_generation)
     @variable(saa, spill₂[1:n_samples2] >= 0)
     @variable(saa, 0 <= termos₂[1:n_samples2, i=1:termo_count] <= problem.termo_generations[i])
-    
+
     @variable(saa, 0 <= volume₃[1:n_samples2, 1:n_samples3] <= problem.hydro_capacity)
     @variable(saa, 0 <= hydro₃[1:n_samples2, 1:n_samples3] <= problem.hydro_generation)
     @variable(saa, spill₃[1:n_samples2, 1:n_samples3] >= 0)
     @variable(saa, 0 <= termos₃[1:n_samples2, 1:n_samples3, i=1:termo_count] <= problem.termo_generations[i])
-    
+
     @variable(saa, θ[1:n_samples2, 1:n_samples3] >= 0)
 
     @constraint(saa, volume₁ == problem.initial_volume + problem.initial_inflow - hydro₁ - spill₁)
@@ -366,21 +369,22 @@ function saa_solution(problem::HydroProblem, n_samples2::Int, n_samples3::Int = 
     )
 
     dt = @elapsed optimize!(saa)
-    saa_obj = objective_value(saa)
-    saa_hydro₁ = value(hydro₁)
-    saa_vol₁ = value(volume₁)
-    saa_termos₁ = value.(termos₁)
 
-    return dt, saa_obj, saa_hydro₁, saa_vol₁, saa_termos₁
+    return (;
+        Obj = objective_value(saa),
+        Bound = -Inf,
+        H₁ = value(hydro₁),
+        V₁ = value(volume₁),
+        T₁ = value.(termos₁),
+        dt,
+    )
 end
 
 """
 SDDP solution for hydro-thermal model.
 
 - Inflows are sampled from problem.inflow_distr.
-
-Returns:
-- objective value and first-stage decisions.
+- Reports the SDDP lower bound instead of an objective value.
 """
 function sddp_solution(problem::HydroProblem, n_samples::Vector{Int})
     T = length(n_samples)
@@ -417,7 +421,7 @@ function sddp_solution(problem::HydroProblem, n_samples::Vector{Int})
         # Last-stage value function
         @variable(sp, θ >= 0)
         if t == T
-            @constraint(sp, [k in 1:cuts_count], θ >= problem.cuts_coeff[k] * volume.out + problem.cuts_inter[k]) 
+            @constraint(sp, [k in 1:cuts_count], θ >= problem.cuts_coeff[k] * volume.out + problem.cuts_inter[k])
         end
 
         SDDP.@stageobjective(
@@ -432,164 +436,28 @@ function sddp_solution(problem::HydroProblem, n_samples::Vector{Int})
             cut_deletion_minimum = 50,
     )
     sp1 = pb[1].subproblem
-    pb_bound = SDDP.calculate_bound(pb)
-    pb_hydro₁ = value(sp1[:hydro])
-    pb_vol₁ = value(sp1[:volume].out)
-    pb_termos₁ = value.(sp1[:termos])
 
-    return dt, pb_bound, pb_hydro₁, pb_vol₁, pb_termos₁
-end
-
-
-struct TestResult
-    method::String
-    obj::Float64
-    hydro::Float64
-    volume::Float64
-    termos::Vector{Float64}
-    hydro₂::Float64
-    volume₂::Float64
-    termos₂::Vector{Float64}
-    perf::Float64
-    std_perf::Float64
-    bound::Float64
-    time::Float64
+    return (;
+        Obj = +Inf,
+        Bound = SDDP.calculate_bound(pb),
+        H₁ = value(sp1[:hydro]),
+        V₁ = value(sp1[:volume].out),
+        T₁ = value.(sp1[:termos]),
+        dt,
+    )
 end
 
 
 function compare_methods(problem::HydroProblem)
-    results = TestResult[]
-    scenarios_count = 1000
+    sample_sizes = repeat([4, 10, 30, 100]; inner = 3)
+    solvers = [
+        "EV" => expected_value_solution
+        ["LDR ($n breakpoints)" => p -> ldr_solution(p, n) for n in 0:3]
+        ["SAA ($n x 30 samples)" => p -> saa_solution(p, n) for n in sample_sizes]
+        ["SDDP ($n x 100 samples)" => p -> sddp_solution(p, [1, n, 100]) for n in sample_sizes]
+    ]
 
-    # --- EV ---
-    print("Solving EV model...")
-    ev_dt, ev_obj, ev_hydro₁, ev_vol₁, ev_termos₁ = expected_value_solution(problem)
-    print(" evaluating policy...")
-    ev_fst, ev_std, ev_hydro₂, ev_vol₂, ev_termos₂ = evaluate_firststage(problem, ev_vol₁, scenarios_count)
-    ev_perf = ev_fst + sum(ev_termos₁[i]*problem.termo_costs[i] for i in 1:problem.termo_count)
-    push!(results,
-          TestResult(
-              "EV",
-              ev_obj,
-              ev_hydro₁,
-              ev_vol₁,
-              ev_termos₁,
-              ev_hydro₂,
-              ev_vol₂,
-              vec(ev_termos₂),
-              ev_perf,
-              ev_std,
-              -Inf,
-              ev_dt
-          )
-    )
-    println(" done.")
-
-    # --- LDR with different numbers of breakpoints ---
-    print("Solving LDR models:")
-    for n_breakpoints in 0:3
-        print(" $n_breakpoints,")
-        ldr_dt, ldr_p_obj, ldr_d_obj, ldr_hydro₁, ldr_vol₁, ldr_termos₁ =
-            ldr_solution(problem, n_breakpoints)
-        ldr_fst, ldr_std, ldr_hydro₂, ldr_vol₂, ldr_termos₂ = evaluate_firststage(problem, ldr_vol₁, scenarios_count)
-        ldr_perf = ldr_fst + sum(ldr_termos₁[i]*problem.termo_costs[i] for i in 1:problem.termo_count)
-        push!(
-            results,
-            TestResult(
-                "LDR ($n_breakpoints breakpoints)",
-                ldr_p_obj,
-                ldr_hydro₁,
-                ldr_vol₁,
-                ldr_termos₁,
-                ldr_hydro₂,
-                ldr_vol₂,
-                vec(ldr_termos₂),
-                ldr_perf,
-                ldr_std,
-                ldr_d_obj,
-                ldr_dt,
-            ),
-        )
-    end
-    println(" done.")
-
-    # --- SAA with multiple sample sizes ---
-    print("Solving SAA models:")
-    for N_samples in repeat([4, 10, 30, 100]; inner = 3)
-        print(" $N_samples,")
-        saa_dt, saa_obj, saa_hydro₁, saa_vol₁, saa_termos₁ = saa_solution(problem, N_samples)
-        saa_fst, saa_std, saa_hydro₂, saa_vol₂, saa_termos₂ = evaluate_firststage(problem, saa_vol₁, scenarios_count)
-        saa_perf = saa_fst + sum(saa_termos₁[i]*problem.termo_costs[i] for i in 1:problem.termo_count)
-        push!(
-            results,
-            TestResult(
-                "SAA ($N_samples x 30 samples)",
-                saa_obj,
-                saa_hydro₁,
-                saa_vol₁,
-                saa_termos₁,
-                saa_hydro₂,
-                saa_vol₂,
-                vec(saa_termos₂),
-                saa_perf,
-                saa_std,
-                -Inf,
-                saa_dt,
-            ),
-        )
-    end
-    println(" done.")
-
-    # --- SDDP model with multiple sample sizes ---
-    print("Solving SDDP models:")
-    for N_samples in repeat([4, 10, 30, 100]; inner = 3)
-        print(" $N_samples,")
-        sddp_dt, sddp_bound, sddp_hydro₁, sddp_vol₁, sddp_termos₁ = sddp_solution(problem, [1, N_samples, 100])
-        sddp_fst, sddp_std, sddp_hydro₂, sddp_vol₂, sddp_termos₂ = evaluate_firststage(problem, sddp_vol₁, scenarios_count)
-        sddp_perf = sddp_fst + sum(sddp_termos₁[i]*problem.termo_costs[i] for i in 1:problem.termo_count)
-        push!(
-            results,
-            TestResult(
-                "SDDP ($N_samples x 100 samples)",
-                +Inf,
-                sddp_hydro₁,
-                sddp_vol₁,
-                sddp_termos₁,
-                sddp_hydro₂,
-                sddp_vol₂,
-                vec(sddp_termos₂),
-                sddp_perf,
-                sddp_std,
-                sddp_bound,
-                sddp_dt,
-            ),
-        )
-    end
-    println(" done.")
-
-    # --- Print table ---
-    n = problem.termo_count
-    t1_headers = join(["   T$(i)₁" for i in 1:n], "  ")
-    t2_headers = join(["   T$(i)₂" for i in 1:n], "  ")
-    header = @sprintf(
-        "%-25s  %9s  %9s  %11s | %7s  %7s  %-s | %7s  %7s  %-s | %9s %9s",
-        "Method", "Obj", "Bound", "Time (ms)", "H₁", "V₁", t1_headers, "H₂", "V₂", t2_headers, "Perf", "Std"
-    )
-    println(header)
-    println(repeat("-", length(header)))
-    for r in results
-        t1_str = join([@sprintf("%6.2f", t) for t in r.termos],  "  ")
-        t2_str = join([@sprintf("%6.2f", t) for t in r.termos₂], "  ")
-        @printf(
-            "%-25s  %9.2f  %9.2f  %11.2f | %7.2f  %7.2f  %-s | %7.2f  %7.2f  %-s | %9.2f %9.2f\n",
-            r.method, r.obj, r.bound, 1000 * r.time,
-            r.hydro, r.volume, t1_str,
-            r.hydro₂, r.volume₂, t2_str,
-            r.perf, r.std_perf
-        )
-    end
-
-    return results
+    return run_comparison(problem, solvers; evaluate = evaluate_policy)
 end
 
 """
