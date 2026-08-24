@@ -427,7 +427,7 @@ function sddp_solution(problem::HydroProblem, n_samples::Vector{Int})
     end
 
     dt = @elapsed SDDP.train(pb;
-            time_limit = 5,
+            iteration_limit = 400,
             print_level = 0,
             cut_deletion_minimum = 50,
     )
