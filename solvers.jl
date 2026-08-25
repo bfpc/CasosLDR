@@ -3,8 +3,15 @@ module SolverList
 using JuMP
 using Ipopt, HiGHS
 
-ipopt = Ipopt.Optimizer
-highs_asm = HiGHS.Optimizer
-highs_ipm = optimizer_with_attributes(HiGHS.Optimizer, "solver" => "ipm")
+ipopt = optimizer_with_attributes(Ipopt.Optimizer, "max_cpu_time" => 60.0)
+highs_asm = optimizer_with_attributes(
+    HiGHS.Optimizer,
+    "solver" => "asm",
+    "time_limit" => 60.0)
+highs_ipm = optimizer_with_attributes(
+	HiGHS.Optimizer,
+	"solver" => "ipm",
+	"time_limit" => 60.0,
+)
 
 end
