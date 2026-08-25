@@ -9,7 +9,11 @@ include("HydroQuad/hydroquad_pw.jl")
 include("solvers.jl")
 
 problems = [Newsvendor, HydroToy2, HydroToy3, HydroQuad, HydroQuadPw]
-all_solvers = [SolverList.ipopt, SolverList.highs_asm, SolverList.highs_ipm]
+all_solvers = [
+    "Ipopt" => SolverList.ipopt,
+    "HiGHS (ASM)" => SolverList.highs_asm,
+    "HiGHS (IPM)" => SolverList.highs_ipm,
+]
 
 function test_default()
     for m in problems
@@ -21,9 +25,9 @@ function test_default()
 end
 
 function test_solvers(problem::Module)
-    for s in all_solvers
+    for (name, solver) in all_solvers
         println(repeat("=", 90))
-        println("Testing solver: $(s)")
-        problem.main(s)
+        println("Testing solver: $(name)")
+        problem.main(solver)
     end
 end
