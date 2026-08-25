@@ -173,7 +173,7 @@ function compare_methods(problem::NewsvendorProblem)
          n in repeat([4, 10, 30, 100]; inner = 3)]
     ]
 
-    return run_comparison(problem, solvers; evaluate = evaluate_policy, verbose = false)
+    return run_comparison(problem, solvers; evaluate = evaluate_policy, verbose = true)
 end
 
 function main(solver = default_solver)
