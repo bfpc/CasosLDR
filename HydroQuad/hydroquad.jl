@@ -201,7 +201,7 @@ function expected_value_solution(problem::HydroProblem)
 
     return (;
         Obj = objective_value(ev),
-        Bound = +Inf,
+        Bound = -Inf,
         H₁ = value(hydro[1]),
         V₁ = value(volume[1]),
         T₁ = value(termo[1]),
@@ -323,7 +323,7 @@ function saa_solution(problem::HydroProblem, n_samples::Int)
 
     return (;
         Obj = objective_value(saa),
-        Bound = +Inf,
+        Bound = -Inf,
         H₁ = value(hydro₁),
         V₁ = value(volume₁),
         T₁ = value(termo₁),
