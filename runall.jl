@@ -13,6 +13,8 @@ all_solvers = [
     "Ipopt" => SolverList.ipopt,
     "HiGHS (ASM)" => SolverList.highs_asm,
     "HiGHS (IPM)" => SolverList.highs_ipm,
+    "Algencan" => SolverList.algencan,
+    "Clarabel" => SolverList.clarabel
 ]
 
 function test_default()
