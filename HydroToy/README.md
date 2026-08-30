@@ -33,10 +33,12 @@ We take inflows to be independent across time, and the SAA and LDR models are pa
 Besides the SAA and LDR models, a third stochastic model is included that uses a Stochastic Dual Dynamic Programming (SDDP) approximation to decide the policy.
 The SDDP model is parameterized by the number of scenarios (to build the SAA scenario tree) and a time limit.
 
-Current limitations:
-* The `evaluate_first_stage` uses a deterministic SAA model to choose the second-stage decisions, which is only an approximation;
+Design choices:
 * The SAA model uses a tree of $N \times 30$ scenarios, which could be too small in the 3rd stage;
 * The SDDP model uses a tree of $N \times 100$ scenarios;
-* SDDP has a fixed time limit of 5 seconds;
-* The LDR model uses the same number of breakpoints in each stage;
+* SDDP has a fixed limit of 400 iterations;
+* The LDR model uses the same number of breakpoints in each stage.
+
+Limitations:
+* The `evaluate_first_stage` uses a deterministic SAA model wth 100 uniformly chosen scenarios to evaluate the costs; this is only a Monte-Carlo approximation;
 * The LDR model does not use "cross-stage" breakpoints, which could improve the approximation of the second-stage decisions.
