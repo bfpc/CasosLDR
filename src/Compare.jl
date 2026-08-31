@@ -13,7 +13,7 @@ using Statistics
 export run_comparison, average_scenarios, cached_model, with_warmup
 
 """
-    run_comparison(problem, solvers; evaluate, verbose = true)
+    run_comparison(problem, solvers; evaluate, verbose = true, summarize = true)
 
 Run every `name => solve` pair of `solvers` on `problem`, print the comparison
 table and return the rows.
@@ -30,8 +30,13 @@ reports it as `Time (ms)`.  Both are printed in milliseconds.
 All solvers must return the same field names, and likewise all `evaluate` calls:
 the field names are the columns of the table, in the order they appear.
 Vector-valued fields are expanded into one column per entry.
+
+When `summarize` is set, consecutive entries of `solvers` that share a name -- the
+replications of one method, e.g. three runs of `"SAA (10 samples)"` -- get an
+extra `mean ± std` line under them in the printed table.  The returned rows are
+always the raw ones, one per entry of `solvers`.
 """
-function run_comparison(problem, solvers; evaluate, verbose = true)
+function run_comparison(problem, solvers; evaluate, verbose = true, summarize = true)
     rows = NamedTuple[]
     for (name, solve) in solvers
         verbose && print("Solving $name ...")
@@ -50,7 +55,7 @@ function run_comparison(problem, solvers; evaluate, verbose = true)
             ),
         )
     end
-    print_table(rows)
+    print_table(summarize ? with_summaries(rows) : rows)
     return rows
 end
 
@@ -123,6 +128,50 @@ function cells(row)
     end
     return columns
 end
+
+"""
+    with_summaries(rows)
+
+`rows` with a `mean ± std` line inserted after each run of consecutive rows that
+share a `Method` name, i.e. after each group of replications of one method.
+Constant columns (a `-Inf` bound, say) are reported as the value alone.
+"""
+function with_summaries(rows)
+    table = NamedTuple[]
+    group = NamedTuple[]
+    flush!() = begin
+        append!(table, group)
+        length(group) > 1 && push!(table, summary_row(group))
+        empty!(group)
+    end
+    for row in rows
+        isempty(group) || row.Method == first(group).Method || flush!()
+        push!(group, row)
+    end
+    flush!()
+    return table
+end
+
+"The `mean ± std` line of a group of replications of one method."
+function summary_row(group)
+    columns = keys(first(group))
+    summary(key) =
+        key === :Method ? "  ↳ mean ± std" :
+        mean_std([getproperty(row, key) for row in group])
+    return NamedTuple{columns}(map(summary, columns))
+end
+
+"`mean ± std` of the replications of one column, formatted for the table."
+function mean_std(values::AbstractVector{<:Real})
+    all(isequal(first(values)), values) && return format(first(values))
+    return string(format(mean(values)), " ± ", format(std(values)))
+end
+
+mean_std(values::AbstractVector{<:AbstractVector{<:Real}}) =
+    [mean_std([value[i] for value in values]) for i in eachindex(first(values))]
+
+# Non-numeric columns (a solver status, say) have no meaningful summary.
+mean_std(values) = ""
 
 "Print `rows` as a table, sizing each column to its widest entry."
 function print_table(rows; io = stdout)
