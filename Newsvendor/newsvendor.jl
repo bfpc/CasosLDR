@@ -167,19 +167,25 @@ end
 
 # `n_scenarios` is accepted and ignored: the newsvendor policy is evaluated
 # analytically, so there is no out-of-sample sample size to choose here.
-function compare_methods(problem::NewsvendorProblem; n_scenarios = nothing)
+# Remaining keyword arguments, `summarize` in particular, go to `run_comparison`.
+function compare_methods(
+    problem::NewsvendorProblem;
+    n_scenarios = nothing,
+    replications = 3,
+    kwargs...,
+)
     solvers = [
         "EV" => expected_value_solution
         ["LDR ($n breakpoints)" => p -> ldr_solution(p; n_breakpoints = n) for n in 0:3]
         ["SAA ($n samples)" => p -> saa_solution(p, n) for
-         n in repeat([4, 10, 30, 100]; inner = 3)]
+         n in repeat([4, 10, 30, 100]; inner = replications)]
     ]
 
     return run_comparison(
         problem,
         with_warmup(solvers);
         evaluate = evaluate_policy,
-        verbose = true,
+        kwargs...,
     )
 end
 

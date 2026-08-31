@@ -452,8 +452,14 @@ function sddp_solution(problem::HydroProblem, n_samples::Vector{Int})
 end
 
 
-function compare_methods(problem::HydroProblem; n_scenarios = 1_000)
-    sample_sizes = repeat([4, 10, 30, 100]; inner = 3)
+# Remaining keyword arguments, `summarize` in particular, go to `run_comparison`.
+function compare_methods(
+    problem::HydroProblem;
+    n_scenarios = 1_000,
+    replications = 3,
+    kwargs...,
+)
+    sample_sizes = repeat([4, 10, 30, 100]; inner = replications)
     solvers = [
         "EV" => expected_value_solution
         ["LDR ($n breakpoints)" => p -> ldr_solution(p, n) for n in 0:3]
@@ -465,6 +471,7 @@ function compare_methods(problem::HydroProblem; n_scenarios = 1_000)
         problem,
         with_warmup(solvers);
         evaluate = (p, sol) -> evaluate_policy(p, sol; n_scenarios),
+        kwargs...,
     )
 end
 

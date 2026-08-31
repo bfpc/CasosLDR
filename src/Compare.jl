@@ -10,10 +10,10 @@ module Compare
 using Printf
 using Statistics
 
-export run_comparison, average_scenarios, cached_model, with_warmup
+export run_comparison, average_scenarios, cached_model, with_warmup, Trial
 
 """
-    run_comparison(problem, solvers; evaluate, verbose = true, summarize = true)
+    run_comparison(problem, solvers; evaluate, verbose = true, summarize = :append)
 
 Run every `name => solve` pair of `solvers` on `problem`, print the comparison
 table and return the rows.
@@ -31,47 +31,123 @@ All solvers must return the same field names, and likewise all `evaluate` calls:
 the field names are the columns of the table, in the order they appear.
 Vector-valued fields are expanded into one column per entry.
 
-When `summarize` is set, consecutive entries of `solvers` that share a name -- the
-replications of one method, e.g. three runs of `"SAA (10 samples)"` -- get an
-extra `mean ± std` line under them in the printed table.  The returned rows are
-always the raw ones, one per entry of `solvers`.
+An entry of `solvers` may also be a `Trial`, which additionally says whether the
+solution is to be evaluated; the evaluation columns of an unevaluated trial are
+filled with `NaN`.
+
+`summarize` controls the `mean ± std` line that consecutive entries sharing a
+name -- the replications of one method, e.g. three runs of `"SAA (10 samples)"` --
+get in the printed table:
+
+  * `:append` adds the summary line under the rows it summarizes,
+  * `:only` replaces them by it, which is what a run with many replications
+    wants,
+  * `:none` prints the rows alone.
+
+The returned rows are always the raw ones, one per entry of `solvers`.
 """
-function run_comparison(problem, solvers; evaluate, verbose = true, summarize = true)
-    rows = NamedTuple[]
-    for (name, solve) in solvers
-        verbose && print("Solving $name ...")
-        t = @elapsed sol = solve(problem)
-        verbose && print(" evaluating policy ...")
-        perf = evaluate(problem, sol)
+function run_comparison(problem, solvers; evaluate, verbose = true, summarize = :append)
+    summarize in (:append, :only, :none) ||
+        throw(ArgumentError("summarize must be :append, :only or :none"))
+
+    records = NamedTuple[]
+    for trial in map(Trial, solvers)
+        verbose && print("Solving $(trial.name) ...")
+        t = @elapsed sol = trial.solve(problem)
+        perf = nothing
+        if trial.evaluated
+            verbose && print(" evaluating policy ...")
+            perf = evaluate(problem, sol)
+        end
         verbose && println(" done.")
-        push!(
-            rows,
-            (;
-                Method = name,
-                drop(sol, :dt)...,
-                perf...,
-                var"Opt time" = 1000 * get(sol, :dt, NaN),
-                var"Time (ms)" = 1000 * t,
-            ),
-        )
+        push!(records, (; trial.name, sol, perf, t))
     end
-    print_table(summarize ? with_summaries(rows) : rows)
+
+    rows = comparison_rows(records)
+    print_table(
+        summarize === :none ? rows : with_summaries(rows; only = summarize === :only),
+    )
     return rows
 end
 
 """
-    with_warmup(solvers, count = 3; suffix = " (warmup)")
+    Trial(name, solve; evaluated = true)
 
-Prepend a throw-away run of the first `count` entries of `solvers`, renamed with
-`suffix`.  Those rows pay for the first-call compilation of the solution methods
-and of the evaluation code, so the timings of the rest of the table measure
-solving rather than compiling.  The default `count` covers the `EV`, `LDR (0)`
-and `LDR (1)` entries the case studies list first.
+One line of the comparison table: `solve(problem)`, reported under `name` and,
+unless `evaluated` is unset, assessed out of sample.  `run_comparison` accepts a
+`Trial` wherever it accepts a `name => solve` pair.
 """
-function with_warmup(solvers, count = 3; suffix = " (warmup)")
-    warmup = [name * suffix => solve for (name, solve) in solvers[1:min(count, end)]]
-    return [warmup; collect(solvers)]
+struct Trial
+    name::String
+    solve::Any
+    evaluated::Bool
 end
+
+Trial(name, solve; evaluated = true) = Trial(name, solve, evaluated)
+Trial(trial::Trial) = trial
+Trial(entry::Pair) = Trial(first(entry), last(entry))
+
+"""
+    with_warmup(solvers, count = 3; suffix = " (warmup)", families = true)
+
+Prepend a throw-away run of some entries of `solvers`, renamed with `suffix`.
+Those rows pay for the first-call compilation of the solution methods, so the
+timings of the rest of the table measure solving rather than compiling -- which
+also keeps compilation out of the `mean ± std` of a group of replications.
+
+Warmed up are the first `count` entries, which covers the `EV`, `LDR (0)` and
+`LDR (1)` entries the case studies list first, and, unless `families` is unset,
+the first entry of every other method family (`SAA`, `SDDP`, ...), a family being
+everything up to the first space of a name.
+
+Warmup solutions are not evaluated out of sample -- their timings are the point,
+not their quality -- so their evaluation columns are `NaN`.
+"""
+function with_warmup(solvers, count = 3; suffix = " (warmup)", families = true)
+    trials = map(Trial, collect(solvers))
+    chosen = collect(1:min(count, length(trials)))
+    if families
+        warmed = Set(family(trials[i].name) for i in chosen)
+        for (i, trial) in enumerate(trials)
+            family(trial.name) in warmed && continue
+            push!(warmed, family(trial.name))
+            push!(chosen, i)
+        end
+    end
+    warmup = [
+        Trial(trials[i].name * suffix, trials[i].solve; evaluated = false) for
+        i in sort(chosen)
+    ]
+    return [warmup; trials]
+end
+
+"The method family of a table line: its name up to the first space."
+family(name::AbstractString) = first(split(name, ' '))
+
+"""
+    comparison_rows(records)
+
+One table row per record, with the columns of the solution, of its evaluation and
+of the two timings.  Records of unevaluated trials get the evaluation columns of
+the others, filled with `NaN`.
+"""
+function comparison_rows(records)
+    evaluated = findfirst(record -> record.perf !== nothing, records)
+    blank = evaluated === nothing ? (;) : blank_evaluation(records[evaluated].perf)
+    return NamedTuple[
+        (;
+            Method = record.name,
+            drop(record.sol, :dt)...,
+            (record.perf === nothing ? blank : record.perf)...,
+            var"Opt time" = 1000 * get(record.sol, :dt, NaN),
+            var"Time (ms)" = 1000 * record.t,
+        ) for record in records
+    ]
+end
+
+"The columns of the evaluation `perf`, filled with `NaN`."
+blank_evaluation(perf::NamedTuple) =
+    map(value -> value isa AbstractVector ? fill(NaN, length(value)) : NaN, perf)
 
 "The NamedTuple `nt` without its `key` field."
 drop(nt::NamedTuple, key::Symbol) = NamedTuple{filter(!=(key), keys(nt))}(nt)
@@ -130,18 +206,23 @@ function cells(row)
 end
 
 """
-    with_summaries(rows)
+    with_summaries(rows; only = false)
 
 `rows` with a `mean ± std` line inserted after each run of consecutive rows that
-share a `Method` name, i.e. after each group of replications of one method.
-Constant columns (a `-Inf` bound, say) are reported as the value alone.
+share a `Method` name, i.e. after each group of replications of one method, or
+with each such group replaced by that line if `only` is set.  Constant columns (a
+`-Inf` bound, say) are reported as the value alone.
 """
-function with_summaries(rows)
+function with_summaries(rows; only = false)
     table = NamedTuple[]
     group = NamedTuple[]
     flush!() = begin
-        append!(table, group)
-        length(group) > 1 && push!(table, summary_row(group))
+        if length(group) > 1
+            only || append!(table, group)
+            push!(table, summary_row(group, only ? first(group).Method : "  ↳ mean ± std"))
+        else
+            append!(table, group)
+        end
         empty!(group)
     end
     for row in rows
@@ -152,12 +233,11 @@ function with_summaries(rows)
     return table
 end
 
-"The `mean ± std` line of a group of replications of one method."
-function summary_row(group)
+"The `mean ± std` line of a group of replications of one method, named `label`."
+function summary_row(group, label)
     columns = keys(first(group))
     summary(key) =
-        key === :Method ? "  ↳ mean ± std" :
-        mean_std([getproperty(row, key) for row in group])
+        key === :Method ? label : mean_std([getproperty(row, key) for row in group])
     return NamedTuple{columns}(map(summary, columns))
 end
 

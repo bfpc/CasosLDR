@@ -352,18 +352,25 @@ function saa_solution(problem::HydroProblem, n_samples::Int)
 end
 
 
-function compare_methods(problem::HydroProblem; n_scenarios = 10_000)
+# Remaining keyword arguments, `summarize` in particular, go to `run_comparison`.
+function compare_methods(
+    problem::HydroProblem;
+    n_scenarios = 10_000,
+    replications = 3,
+    kwargs...,
+)
     solvers = [
         "EV" => expected_value_solution
         ["LDR ($n breakpoints)" => p -> ldr_solution(p, n) for n in 0:3]
         ["SAA ($n samples)" => p -> saa_solution(p, n) for
-         n in repeat([4, 10, 30, 100]; inner = 3)]
+         n in repeat([4, 10, 30, 100]; inner = replications)]
     ]
 
     return run_comparison(
         problem,
         with_warmup(solvers);
         evaluate = (p, sol) -> evaluate_policy(p, sol; n_scenarios),
+        kwargs...,
     )
 end
 
