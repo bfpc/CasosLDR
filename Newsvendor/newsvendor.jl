@@ -165,7 +165,9 @@ function saa_solution(problem::NewsvendorProblem, N_samples)
     return (; Obj = objective_value(saa), Bound = +Inf, Buy = value(buy), dt)
 end
 
-function compare_methods(problem::NewsvendorProblem)
+# `n_scenarios` is accepted and ignored: the newsvendor policy is evaluated
+# analytically, so there is no out-of-sample sample size to choose here.
+function compare_methods(problem::NewsvendorProblem; n_scenarios = nothing)
     solvers = [
         "EV" => expected_value_solution
         ["LDR ($n breakpoints)" => p -> ldr_solution(p; n_breakpoints = n) for n in 0:3]
@@ -173,10 +175,15 @@ function compare_methods(problem::NewsvendorProblem)
          n in repeat([4, 10, 30, 100]; inner = 3)]
     ]
 
-    return run_comparison(problem, solvers; evaluate = evaluate_policy, verbose = true)
+    return run_comparison(
+        problem,
+        with_warmup(solvers);
+        evaluate = evaluate_policy,
+        verbose = true,
+    )
 end
 
-function main(solver = default_solver)
+function main(solver = default_solver; kwargs...)
     # LDR loses to EV in re-optimization
     problem1 = NewsvendorProblem(
         10.0, # buy_cost
@@ -185,7 +192,7 @@ function main(solver = default_solver)
         Uniform(80, 120), # demand_distr
         solver,
     )
-    compare_methods(problem1)
+    compare_methods(problem1; kwargs...)
 
     println(repeat("=", 90))
 
@@ -197,7 +204,7 @@ function main(solver = default_solver)
         Uniform(80, 120), # demand_distr
         solver,
     )
-    compare_methods(problem2)
+    compare_methods(problem2; kwargs...)
 
     return
 end

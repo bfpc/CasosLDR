@@ -10,7 +10,7 @@ module Compare
 using Printf
 using Statistics
 
-export run_comparison, average_scenarios, cached_model
+export run_comparison, average_scenarios, cached_model, with_warmup
 
 """
     run_comparison(problem, solvers; evaluate, verbose = true)
@@ -52,6 +52,20 @@ function run_comparison(problem, solvers; evaluate, verbose = true)
     end
     print_table(rows)
     return rows
+end
+
+"""
+    with_warmup(solvers, count = 3; suffix = " (warmup)")
+
+Prepend a throw-away run of the first `count` entries of `solvers`, renamed with
+`suffix`.  Those rows pay for the first-call compilation of the solution methods
+and of the evaluation code, so the timings of the rest of the table measure
+solving rather than compiling.  The default `count` covers the `EV`, `LDR (0)`
+and `LDR (1)` entries the case studies list first.
+"""
+function with_warmup(solvers, count = 3; suffix = " (warmup)")
+    warmup = [name * suffix => solve for (name, solve) in solvers[1:min(count, end)]]
+    return [warmup; collect(solvers)]
 end
 
 "The NamedTuple `nt` without its `key` field."

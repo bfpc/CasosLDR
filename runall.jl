@@ -15,19 +15,22 @@ all_solvers = [
     "HiGHS (IPM)" => SolverList.highs_ipm,
 ]
 
-function test_default()
+# Extra keyword arguments go to each case study's `main`; in particular
+# `n_scenarios` sets the out-of-sample sample size of the hydro-thermal cases,
+# so `test_default(n_scenarios = 100)` is a quick smoke test of the package.
+function test_default(; kwargs...)
     for m in problems
         println(repeat("=", 90))
         println("Running $(m)")
-        m.main()
+        m.main(; kwargs...)
         println()
     end
 end
 
-function test_solvers(problem::Module)
+function test_solvers(problem::Module; kwargs...)
     for (name, solver) in all_solvers
         println(repeat("=", 90))
         println("Testing solver: $(name)")
-        problem.main(solver)
+        problem.main(solver; kwargs...)
     end
 end

@@ -352,7 +352,7 @@ function saa_solution(problem::HydroProblem, n_samples::Int)
 end
 
 
-function compare_methods(problem::HydroProblem)
+function compare_methods(problem::HydroProblem; n_scenarios = 10_000)
     solvers = [
         "EV" => expected_value_solution
         ["LDR ($n breakpoints)" => p -> ldr_solution(p, n) for n in 0:3]
@@ -360,7 +360,11 @@ function compare_methods(problem::HydroProblem)
          n in repeat([4, 10, 30, 100]; inner = 3)]
     ]
 
-    return run_comparison(problem, solvers; evaluate = evaluate_policy)
+    return run_comparison(
+        problem,
+        with_warmup(solvers);
+        evaluate = (p, sol) -> evaluate_policy(p, sol; n_scenarios),
+    )
 end
 
 """
@@ -393,9 +397,9 @@ function build_toy_problem(solver = default_solver)
     )
 end
 
-function main(solver = default_solver)
+function main(solver = default_solver; kwargs...)
     toy = build_toy_problem(solver)
-    compare_methods(toy)
+    compare_methods(toy; kwargs...)
 end
 
 end # module
