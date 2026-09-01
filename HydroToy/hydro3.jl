@@ -510,6 +510,8 @@ function main(solver = default_solver; kwargs...)
     compare_methods(toy; kwargs...)
 end
 
+include("hydro_scenario.jl")
+
 end # module
 
 if abspath(PROGRAM_FILE) == @__FILE__
