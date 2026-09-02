@@ -2,6 +2,7 @@ isdefined(Main, :Compare) || include(joinpath(@__DIR__, "..", "src", "Compare.jl
 
 module HydroToy3
 
+using LinearAlgebra
 using Random
 
 using JuMP
@@ -460,11 +461,24 @@ function compare_methods(
     kwargs...,
 )
     sample_sizes = repeat([4, 10, 30, 100]; inner = replications)
+    # The basis-function LDR is solved by scenario generation, whose cost grows
+    # with the scenarios that end up active rather than with the sample.
+    generation_sizes = repeat([100, 1_000, 10_000]; inner = replications)
     solvers = [
         "EV" => expected_value_solution
         ["LDR ($n breakpoints)" => p -> ldr_solution(p, n) for n in 0:3]
         ["SAA ($n x 30 samples)" => p -> saa_solution(p, n) for n in sample_sizes]
         ["SDDP ($n x 100 samples)" => p -> sddp_solution(p, [1, n, 100]) for n in sample_sizes]
+        [
+            "Basis-LDR (bp2, $n scenarios)" =>
+                p -> basis_ldr_generation_solution(p, bp2_functions, bp2_stages; n_scen = n)
+            for n in generation_sizes
+        ]
+        [
+            "Basis-LDR (pw3, $n scenarios)" =>
+                p -> basis_ldr_generation_solution(p, pw3_functions, pw3_stages; n_scen = n)
+            for n in generation_sizes
+        ]
     ]
 
     return run_comparison(
