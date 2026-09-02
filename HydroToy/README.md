@@ -42,3 +42,17 @@ Design choices:
 Limitations:
 * The `evaluate_first_stage` uses a deterministic SAA model wth 100 uniformly chosen scenarios to evaluate the costs; this is only a Monte-Carlo approximation;
 * The LDR model does not use "cross-stage" breakpoints, which could improve the approximation of the second-stage decisions.
+
+## hydro_scenario.jl
+
+Scenario-wise expansions of the LDR model, written out explicitly rather than through `LinearDecisionRules`:
+- over the extreme points of the uncertainty set (`extreme_point_ldr`), compatible with uniform, independent probabilities (cf `generate_extreme_points`) for each uncertainty;
+- over a sample of the scenarios, with decision rules spanned by a _set_ of piecewise-linear functions of the inflows (`basis_function_ldr`), trying to mitigate the last limitation (the current polyhedral implementation of the LDR package does not support breakpoints over a linear function of the uncertainties).
+
+That last model can also be solved by two **decompositions** of its decision-rule coefficients:
+- a Benders decomposition; and
+- a scenario (constraint) generation
+
+The details on the decompositions, and how they compare to each other and to a single LP are in [Decomposition.md](Decomposition.md).
+
+The `compare_methods` uses scenario generation for its `Basis-LDR` rows: it reaches 100 000 scenarios in about a second and a half, where the monolithic model needs 82 s for 10 000.
