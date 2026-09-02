@@ -118,12 +118,107 @@ pw3_functions = [
 ]
 pw3_stages = [bp2_stages;  repeat([3], 6)]
 
-function basis_function_ldr(problem::HydroProblem, functions, stage_of_func; T=2, solver=HiGHS.Optimizer, n_scen=100)
+"""
+    sample_scenarios(problem, T, n_scen)
+
+`n_scen` inflow scenarios of `T` stages: a deterministic first stage followed by
+independent draws of `problem.inflow_distr`.
+"""
+sample_scenarios(problem::HydroProblem, T, n_scen) =
+    [[problem.initial_inflow; [rand(problem.inflow_distr) for t in 2:T]] for s in 1:n_scen]
+
+"""
+    basis_values(functions, stage_of_func, inflow)
+
+The `n_scen x (1 + length(functions))` matrix `Φ` of basis values, where
+`Φ[k,1] = 1` (the constant term of the decision rule) and `Φ[k,1+j]` is the
+`j`-th basis function evaluated on the inflows scenario `k` reveals up to its
+stage `stage_of_func[j]`.  A decision rule with coefficients `c[1:K]` then takes
+the value `sum(c[j] * Φ[k,j] for j in 1:K)` in scenario `k`.
+"""
+function basis_values(functions, stage_of_func, inflow)
+    n_scen = size(inflow, 2)
+    Φ = ones(n_scen, 1 + length(functions))
+    for (idx, (f, stage)) in enumerate(zip(functions, stage_of_func))
+        for k in 1:n_scen
+            Φ[k, 1+idx] = f(inflow[2:stage, k])
+        end
+    end
+    return Φ
+end
+
+"""
+    add_ldr_coefficients!(model, problem, T, K)
+
+Declare the coefficients of the decision rules -- `K` per decision and stage --
+and return them as a flat vector.
+"""
+function add_ldr_coefficients!(model, problem::HydroProblem, T, K)
+    @variables(model, begin
+        volume_ldr[1:T,1:K]
+        hydro_ldr[1:T,1:K]
+        spill_ldr[1:T,1:K]
+        termos_ldr[1:problem.termo_count, 1:T, 1:K]
+        θ_ldr[1:K]
+    end)
+    return ldr_coefficients(model)
+end
+
+"The decision-rule coefficients of `model` as a flat vector."
+ldr_coefficients(model) = [
+    vec(model[:volume_ldr])
+    vec(model[:hydro_ldr])
+    vec(model[:spill_ldr])
+    vec(model[:termos_ldr])
+    vec(model[:θ_ldr])
+]
+
+"Undo the flattening of `ldr_coefficients` on a vector of coefficient values."
+function reshape_coefficients(problem::HydroProblem, T, K, x)
+    offset = 0
+    next(dims...) = begin
+        block = reshape(x[offset .+ (1:prod(dims))], dims...)
+        offset += prod(dims)
+        block
+    end
+    return (;
+        volume_ldr = next(T, K),
+        hydro_ldr = next(T, K),
+        spill_ldr = next(T, K),
+        termos_ldr = next(problem.termo_count, T, K),
+        θ_ldr = next(K),
+    )
+end
+
+"""
+    fix_nonanticipativity!(model, problem, stage_of_func, T)
+
+Zero the coefficients of the basis functions that a stage-`t` decision may not
+use, because they depend on inflows revealed only later.
+"""
+function fix_nonanticipativity!(model, problem::HydroProblem, stage_of_func, T)
+    for t in 1:T-1
+        for (idx, stage) in enumerate(stage_of_func)
+            if t < stage
+                fix(model[:volume_ldr][t,1+idx], 0)
+                fix(model[:hydro_ldr][t,1+idx], 0)
+                fix(model[:spill_ldr][t,1+idx], 0)
+                for i in 1:problem.termo_count
+                    fix(model[:termos_ldr][i,t,1+idx], 0)
+                end
+            end
+        end
+    end
+    return model
+end
+
+function basis_function_ldr(problem::HydroProblem, functions, stage_of_func; T=2, solver=HiGHS.Optimizer, n_scen=100, scenarios=nothing)
     ldr = Model(solver)
     set_silent(ldr)
 
     # Uncertainties: inflow
-    scenarios = [[problem.initial_inflow; [rand(problem.inflow_distr) for t in 2:T]] for s in 1:n_scen]
+    scenarios = something(scenarios, sample_scenarios(problem, T, n_scen))
+    n_scen = length(scenarios)
     probs = fill(1/n_scen, n_scen)
     inflow = hcat(scenarios...) # each column is a scenario
     # Decision variables
@@ -151,38 +246,23 @@ function basis_function_ldr(problem::HydroProblem, functions, stage_of_func; T=2
     @objective(ldr, Min, sum(problem.termo_costs[i] * termos[i,t,k] * probs[k] for i in 1:problem.termo_count, t in 1:T, k in 1:n_scen) + sum(θ[k] * probs[k] for k in 1:n_scen))
 
     # Basis LDR decisions
-    basis_size = length(functions)
-    K = 1 + basis_size
-    @variables(ldr, begin
-        volume_ldr[1:T,1:K]
-        hydro_ldr[1:T,1:K]
-        spill_ldr[1:T,1:K]
-        termos_ldr[1:problem.termo_count, 1:T, 1:K]
-    end)
+    Φ = basis_values(functions, stage_of_func, inflow)
+    K = size(Φ, 2)
+    add_ldr_coefficients!(ldr, problem, T, K)
+    volume_ldr, hydro_ldr, spill_ldr, termos_ldr, θ_ldr =
+        ldr[:volume_ldr], ldr[:hydro_ldr], ldr[:spill_ldr], ldr[:termos_ldr], ldr[:θ_ldr]
     # NA constraints
-    for t in 1:T-1
-        for (idx, stage) in enumerate(stage_of_func)
-            if t < stage
-                fix.(volume_ldr[t,1+idx], 0)
-                fix.(hydro_ldr[t,1+idx], 0)
-                fix.(spill_ldr[t,1+idx], 0)
-                for i in 1:problem.termo_count
-                    fix.(termos_ldr[i,t,1+idx], 0)
-                end
-            end
-        end
-    end
+    fix_nonanticipativity!(ldr, problem, stage_of_func, T)
     # LDR constraints
     for t in 1:T
-        @constraint(ldr, [k=1:n_scen], volume[t,k] == volume_ldr[t,1] + sum(volume_ldr[t,1+idx] * f(inflow[2:stage, k]) for (idx,(f,stage)) in enumerate(zip(functions, stage_of_func))))
-        @constraint(ldr, [k=1:n_scen], hydro[t,k] == hydro_ldr[t,1] + sum(hydro_ldr[t,1+idx] * f(inflow[2:stage, k]) for (idx, (f,stage)) in enumerate(zip(functions, stage_of_func))))
-        @constraint(ldr, [k=1:n_scen], spill[t,k] == spill_ldr[t,1] + sum(spill_ldr[t,1+idx] * f(inflow[2:stage, k]) for (idx, (f,stage)) in enumerate(zip(functions, stage_of_func))))
+        @constraint(ldr, [k=1:n_scen], volume[t,k] == sum(volume_ldr[t,j] * Φ[k,j] for j in 1:K))
+        @constraint(ldr, [k=1:n_scen], hydro[t,k] == sum(hydro_ldr[t,j] * Φ[k,j] for j in 1:K))
+        @constraint(ldr, [k=1:n_scen], spill[t,k] == sum(spill_ldr[t,j] * Φ[k,j] for j in 1:K))
         for i in 1:problem.termo_count
-            @constraint(ldr, [k=1:n_scen], termos[i,t,k] == termos_ldr[i,t,1] + sum(termos_ldr[i,t,1+idx] * f(inflow[2:stage, k]) for (idx, (f,stage)) in enumerate(zip(functions, stage_of_func))))
+            @constraint(ldr, [k=1:n_scen], termos[i,t,k] == sum(termos_ldr[i,t,j] * Φ[k,j] for j in 1:K))
         end
     end
-    @variable(ldr, θ_ldr[1:K])
-    @constraint(ldr, [k=1:n_scen], θ[k] == θ_ldr[1] + sum(θ_ldr[1+idx] * f(inflow[2:stage, k]) for (idx, (f,stage)) in enumerate(zip(functions, stage_of_func))))
+    @constraint(ldr, [k=1:n_scen], θ[k] == sum(θ_ldr[j] * Φ[k,j] for j in 1:K))
 
     return ldr
 end
