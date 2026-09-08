@@ -275,6 +275,61 @@ function basis_function_ldr(problem::HydroProblem, functions, stage_of_func; T=2
     return ldr
 end
 
+
+function basis_function_dual_ldr(problem::HydroProblem, functions, stage_of_func; T=2, solver=HiGHS.Optimizer, n_scen=100, scenarios=nothing)
+    ldr = Model(solver)
+    set_silent(ldr)
+
+    # Uncertainties: inflow
+    scenarios = something(scenarios, sample_scenarios(problem, T, n_scen))
+    n_scen = length(scenarios)
+    probs = fill(1/n_scen, n_scen)
+    inflow = inflow_matrix(scenarios) # each column is a scenario
+    # Decision variables
+    @variables(ldr, begin
+        0 <= volume[0:T,1:n_scen] <= problem.hydro_capacity
+        0 <= hydro[1:T,1:n_scen] <= problem.hydro_generation
+        0 <= spill[1:T,1:n_scen]
+        0 <= termos[i=1:problem.termo_count, 1:T, 1:n_scen] <= problem.termo_generations[i]
+    end)
+    # Future cost θ
+    @variable(ldr, θ[1:n_scen] >= 0)
+
+    # Initial conditions
+    fix.(volume[0,1:n_scen], problem.initial_volume; force=true)
+    # Stage decisions
+    for t in 1:T
+        @constraint(ldr, sum(volume[t,k] * scenarios[k] for k in 1:n_scen) == sum( (volume[t-1,k] + inflow[t,k] - hydro[t,k] - spill[t,k]) * scenarios[k] for k in 1:n_scen))
+        @constraint(ldr, sum( (hydro[t,k] + sum(termos[:,t,k])) * scenarios[k] for k in 1:n_scen) == sum( problem.stage_demands[t] * scenarios[k] for k in 1:n_scen))
+    end
+
+    # Future-cost function
+    @constraint(ldr, [i=1:problem.cuts_count], sum(θ[k] * scenarios[k] for k in 1:n_scen) >= sum( (problem.cuts_coeff[i] * volume[T,k] + problem.cuts_inter[i]) * scenarios[k] for k in 1:n_scen))
+
+    @objective(ldr, Min, sum(problem.termo_costs[i] * termos[i,t,k] * probs[k] for i in 1:problem.termo_count, t in 1:T, k in 1:n_scen) + sum(θ[k] * probs[k] for k in 1:n_scen))
+
+    # Basis LDR decisions
+    Φ = basis_values(functions, stage_of_func, inflow)
+    K = size(Φ, 2)
+    add_ldr_coefficients!(ldr, problem, T, K)
+    volume_ldr, hydro_ldr, spill_ldr, termos_ldr, θ_ldr =
+        ldr[:volume_ldr], ldr[:hydro_ldr], ldr[:spill_ldr], ldr[:termos_ldr], ldr[:θ_ldr]
+    # NA constraints
+    fix_nonanticipativity!(ldr, problem, stage_of_func, T)
+    # LDR constraints
+    for t in 1:T
+        @constraint(ldr, [k=1:n_scen], volume[t,k] == sum(volume_ldr[t,j] * Φ[k,j] for j in 1:K))
+        @constraint(ldr, [k=1:n_scen], hydro[t,k] == sum(hydro_ldr[t,j] * Φ[k,j] for j in 1:K))
+        @constraint(ldr, [k=1:n_scen], spill[t,k] == sum(spill_ldr[t,j] * Φ[k,j] for j in 1:K))
+        for i in 1:problem.termo_count
+            @constraint(ldr, [k=1:n_scen], termos[i,t,k] == sum(termos_ldr[i,t,j] * Φ[k,j] for j in 1:K))
+        end
+    end
+    @constraint(ldr, [k=1:n_scen], θ[k] == sum(θ_ldr[j] * Φ[k,j] for j in 1:K))
+
+    return ldr
+end
+
 # ---------------------------------------------------------------------------
 # Two-stage (Benders) decomposition of the basis-function LDR model
 #
