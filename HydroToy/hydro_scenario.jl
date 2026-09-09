@@ -381,6 +381,113 @@ function basis_function_dual_ldr(problem::HydroProblem, functions, stage_of_func
     return ldr
 end
 
+"""
+    basis_function_dual_ldr_compact(problem, functions, stage_of_func; T=2, solver=HiGHS.Optimizer, n_scen=100, scenarios=nothing)
+
+A leaner scenario expansion of the dual LDR than `basis_function_dual_ldr`: a
+canonical-form row only needs a slack -- hence a dual multiplier for
+`dual_ldr_row` to relax -- when it carries information beyond a bound already
+on `x` itself. Every bound of `basis_function_ldr` (`0<=volume<=capacity`,
+`0<=hydro<=generation`, `spill>=0`, `0<=termos<=termo_generations[i]`,
+`θ>=0`) has exactly this shape: its "slack" is just `x` (the lower bound) or
+`bound - x` (the upper one), tied to `x` by a trivial identity rather than a
+genuine coupling. Relaxing *that* identity's multiplier to a basis-restricted
+rule throws away information for nothing, since substituting the identity back
+in changes nothing about what `x` is allowed to be -- it only lets `x` and its
+own bound-slack disagree scenario by scenario, which the model in
+`basis_function_dual_ldr`'s docstring found HiGHS is only too willing to
+exploit, at the cost of the bound (see there for how it got stuck at the
+deterministic mean-scenario value).
+
+So here `volume`, `hydro`, `spill`, `termos` and `θ` keep their ORIGINAL,
+pointwise bounds -- exactly as in `basis_function_ldr` -- and only the rows
+that genuinely couple different components -- water balance, demand balance,
+and the future-cost cuts (the one bound that mixes `θ` and `volume`, so it
+keeps its own slack `cuts_slack`) -- are relaxed to their basis-weighted
+average, following the same derivation as `basis_function_dual_ldr`.
+
+Accepts the same arguments as `basis_function_ldr`. Every row this model
+enforces is also enforced (in one of the two forms) by `basis_function_dual_ldr`,
+so solving it gives a lower bound at least as tight; see
+`dual_ldr_compact_moments` for reading `E[x(ξ)L(ξ)^T]` off the solution.
+"""
+function basis_function_dual_ldr_compact(problem::HydroProblem, functions, stage_of_func; T=2, solver=HiGHS.Optimizer, n_scen=100, scenarios=nothing)
+    ldr = Model(solver)
+    set_silent(ldr)
+
+    # Uncertainties: inflow
+    scenarios = something(scenarios, sample_scenarios(problem, T, n_scen))
+    n_scen = length(scenarios)
+    probs = fill(1/n_scen, n_scen)
+    inflow = inflow_matrix(scenarios) # each column is a scenario
+
+    # Basis functions
+    Φ = basis_values(functions, stage_of_func, inflow)
+
+    # Primal scenario variables x(ξ_k), bounded exactly as in basis_function_ldr:
+    # no slack for a bound that x already carries directly.
+    @variables(ldr, begin
+        0 <= volume[1:T,1:n_scen] <= problem.hydro_capacity
+        0 <= hydro[1:T,1:n_scen] <= problem.hydro_generation
+        0 <= spill[1:T,1:n_scen]
+        0 <= termos[i=1:problem.termo_count,1:T,1:n_scen] <= problem.termo_generations[i]
+        θ[1:n_scen] >= 0
+    end)
+    # The one genuine coupling inequality still needs its own slack s(ξ_k) >= 0
+    @variable(ldr, cuts_slack[1:problem.cuts_count,1:n_scen] >= 0)
+
+    @objective(ldr, Min,
+        sum(problem.termo_costs[i] * termos[i,t,k] * probs[k]
+            for i in 1:problem.termo_count, t in 1:T, k in 1:n_scen) +
+        sum(θ[k] * probs[k] for k in 1:n_scen))
+
+    # Water balance and demand balance: already equalities, no slack
+    for t in 1:T
+        previous = t == 1 ? fill(problem.initial_volume, n_scen) : volume[t-1,:]
+        @constraint(ldr, dual_ldr_row(probs, Φ,
+            volume[t,:] .- previous .- inflow[t,:] .+ hydro[t,:] .+ spill[t,:]) .== 0)
+        @constraint(ldr, dual_ldr_row(probs, Φ,
+            hydro[t,:] .+ sum(termos[i,t,:] for i in 1:problem.termo_count) .-
+            problem.stage_demands[t]) .== 0)
+    end
+    # The future-cost cuts, the one bound genuinely coupling θ and volume
+    for i in 1:problem.cuts_count
+        @constraint(ldr, dual_ldr_row(probs, Φ,
+            cuts_slack[i,:] .+ problem.cuts_coeff[i] .* volume[T,:] .- θ .+ problem.cuts_inter[i]) .== 0)
+    end
+
+    return ldr
+end
+
+"""
+    dual_ldr_compact_moments(model, Φ, probs)
+
+`M_x = E[x(ξ)L(ξ)^T]` of a solved `basis_function_dual_ldr_compact`: the
+basis-weighted average of every scenario's `volume`, `hydro`, `spill`,
+`termos` and `θ`, one `... x size(Φ,2)` matrix per decision. Unlike
+`basis_function_ldr`'s rule, `x(ξ_k)` here is never forced to equal this
+combination -- individual scenarios are free to deviate from it, which is the
+source of the model's extra slack (see `basis_function_dual_ldr`'s docstring)
+-- so `M_x` is only the closest rule-shaped *summary* of the solution, not a
+policy the model guarantees is itself feasible.
+"""
+function dual_ldr_compact_moments(model, Φ, probs)
+    moment(row) = dual_ldr_row(probs, Φ, row)
+    volume, hydro, spill, termos, θ = model[:volume], model[:hydro], model[:spill], model[:termos], model[:θ]
+    T = size(volume, 1)
+    termo_count = size(termos, 1)
+    return (;
+        volume_mx = reduce(vcat, moment(value.(volume[t,:]))' for t in 1:T),
+        hydro_mx = reduce(vcat, moment(value.(hydro[t,:]))' for t in 1:T),
+        spill_mx = reduce(vcat, moment(value.(spill[t,:]))' for t in 1:T),
+        termos_mx = cat(
+            (reduce(vcat, moment(value.(termos[i,t,:]))' for t in 1:T) for i in 1:termo_count)...,
+            dims = 3,
+        ),
+        θ_mx = moment(value.(θ)),
+    )
+end
+
 # ---------------------------------------------------------------------------
 # Two-stage (Benders) decomposition of the basis-function LDR model
 #
