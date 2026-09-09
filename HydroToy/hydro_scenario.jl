@@ -275,7 +275,40 @@ function basis_function_ldr(problem::HydroProblem, functions, stage_of_func; T=2
     return ldr
 end
 
+"""
+    dual_ldr_row(probs, Φ, row)
 
+The basis-weighted average of a canonical-form row over the sample: a `K`-vector,
+one entry per basis function, of `Σ_k probs[k] * row[k] * Φ[k,j]` -- what the
+scenario expansion of the dual LDR (`Dual_scenarios.tex`, eq. 93) sets to zero
+for every row of the canonical form `A x(ξ) + s(ξ) = b(ξ)`.
+"""
+dual_ldr_row(probs, Φ, row) = Φ' * (probs .* row)
+
+"""
+    basis_function_dual_ldr(problem, functions, stage_of_func; T=2, solver=HiGHS.Optimizer, n_scen=100, scenarios=nothing)
+
+Monolithic scenario expansion of the dual linear decision rule of `problem`
+(`Dual_scenarios.tex`, "Scenario expansion"). Where `basis_function_ldr`
+restricts the *primal* decisions to a rule and keeps every dispatch constraint
+exact, scenario by scenario, this restricts the *dual* multiplier instead,
+`z(ξ) = Z·L(ξ)`, and leaves the primal scenario variables `x(ξ_k)`, `s(ξ_k)`
+free. Eliminating `Z` -- the sup over it is `0` where the multiplier's
+coefficient vanishes, `+∞` otherwise -- turns every row of the canonical form
+`A x(ξ) + s(ξ) = b(ξ), s(ξ) ≥ 0` from a pointwise constraint into its
+basis-weighted average over the sample being zero:
+`(1/K) Σ_k (A x(ξ_k) + s(ξ_k) - b(ξ_k)) L(ξ_k)^T = 0`. By weak duality this is
+a *lower* bound on the value of `basis_function_ldr`'s sampled model -- dual to
+that upper bound -- and it can be loose, or even unbounded below, for a basis
+that is too poor, since nothing here forces `x(ξ_k)` itself to be
+non-anticipative.
+
+The canonical form is built explicitly: `volume`, `hydro`, `spill`, `termos`
+and `θ` are free, and every one of their original bounds -- along with the
+future-cost cuts -- becomes an equality against a slack `≥ 0`; the water
+balance and the demand balance, already equalities, get none. Accepts the same
+arguments as `basis_function_ldr`.
+"""
 function basis_function_dual_ldr(problem::HydroProblem, functions, stage_of_func; T=2, solver=HiGHS.Optimizer, n_scen=100, scenarios=nothing)
     ldr = Model(solver)
     set_silent(ldr)
@@ -285,47 +318,65 @@ function basis_function_dual_ldr(problem::HydroProblem, functions, stage_of_func
     n_scen = length(scenarios)
     probs = fill(1/n_scen, n_scen)
     inflow = inflow_matrix(scenarios) # each column is a scenario
-    # Decision variables
-    @variables(ldr, begin
-        0 <= volume[0:T,1:n_scen] <= problem.hydro_capacity
-        0 <= hydro[1:T,1:n_scen] <= problem.hydro_generation
-        0 <= spill[1:T,1:n_scen]
-        0 <= termos[i=1:problem.termo_count, 1:T, 1:n_scen] <= problem.termo_generations[i]
-    end)
-    # Future cost θ
-    @variable(ldr, θ[1:n_scen] >= 0)
 
-    # Initial conditions
-    fix.(volume[0,1:n_scen], problem.initial_volume; force=true)
-    # Stage decisions
+    # Basis functions
+    Φ = basis_values(functions, stage_of_func, inflow)
+
+    # Primal scenario variables x(ξ_k): free, their bounds become slack rows below
+    @variables(ldr, begin
+        volume[1:T,1:n_scen]
+        hydro[1:T,1:n_scen]
+        spill[1:T,1:n_scen]
+        termos[1:problem.termo_count,1:T,1:n_scen]
+        θ[1:n_scen]
+    end)
+
+    # Slacks s(ξ_k) >= 0, one per bound / inequality of basis_function_ldr
+    @variables(ldr, begin
+        volume_hi[1:T,1:n_scen] >= 0
+        volume_lo[1:T,1:n_scen] >= 0
+        hydro_hi[1:T,1:n_scen] >= 0
+        hydro_lo[1:T,1:n_scen] >= 0
+        spill_lo[1:T,1:n_scen] >= 0
+        termos_hi[1:problem.termo_count,1:T,1:n_scen] >= 0
+        termos_lo[1:problem.termo_count,1:T,1:n_scen] >= 0
+        θ_lo[1:n_scen] >= 0
+        cuts_slack[1:problem.cuts_count,1:n_scen] >= 0
+    end)
+
+    @objective(ldr, Min,
+        sum(problem.termo_costs[i] * termos[i,t,k] * probs[k]
+            for i in 1:problem.termo_count, t in 1:T, k in 1:n_scen) +
+        sum(θ[k] * probs[k] for k in 1:n_scen))
+
+    # Water balance and demand balance: already equalities, no slack
     for t in 1:T
-        @constraint(ldr, sum(volume[t,k] * scenarios[k] for k in 1:n_scen) == sum( (volume[t-1,k] + inflow[t,k] - hydro[t,k] - spill[t,k]) * scenarios[k] for k in 1:n_scen))
-        @constraint(ldr, sum( (hydro[t,k] + sum(termos[:,t,k])) * scenarios[k] for k in 1:n_scen) == sum( problem.stage_demands[t] * scenarios[k] for k in 1:n_scen))
+        previous = t == 1 ? fill(problem.initial_volume, n_scen) : volume[t-1,:]
+        @constraint(ldr, dual_ldr_row(probs, Φ,
+            volume[t,:] .- previous .- inflow[t,:] .+ hydro[t,:] .+ spill[t,:]) .== 0)
+        @constraint(ldr, dual_ldr_row(probs, Φ,
+            hydro[t,:] .+ sum(termos[i,t,:] for i in 1:problem.termo_count) .-
+            problem.stage_demands[t]) .== 0)
     end
 
-    # Future-cost function
-    @constraint(ldr, [i=1:problem.cuts_count], sum(θ[k] * scenarios[k] for k in 1:n_scen) >= sum( (problem.cuts_coeff[i] * volume[T,k] + problem.cuts_inter[i]) * scenarios[k] for k in 1:n_scen))
-
-    @objective(ldr, Min, sum(problem.termo_costs[i] * termos[i,t,k] * probs[k] for i in 1:problem.termo_count, t in 1:T, k in 1:n_scen) + sum(θ[k] * probs[k] for k in 1:n_scen))
-
-    # Basis LDR decisions
-    Φ = basis_values(functions, stage_of_func, inflow)
-    K = size(Φ, 2)
-    add_ldr_coefficients!(ldr, problem, T, K)
-    volume_ldr, hydro_ldr, spill_ldr, termos_ldr, θ_ldr =
-        ldr[:volume_ldr], ldr[:hydro_ldr], ldr[:spill_ldr], ldr[:termos_ldr], ldr[:θ_ldr]
-    # NA constraints
-    fix_nonanticipativity!(ldr, problem, stage_of_func, T)
-    # LDR constraints
+    # Bounds, turned into slack rows
     for t in 1:T
-        @constraint(ldr, [k=1:n_scen], volume[t,k] == sum(volume_ldr[t,j] * Φ[k,j] for j in 1:K))
-        @constraint(ldr, [k=1:n_scen], hydro[t,k] == sum(hydro_ldr[t,j] * Φ[k,j] for j in 1:K))
-        @constraint(ldr, [k=1:n_scen], spill[t,k] == sum(spill_ldr[t,j] * Φ[k,j] for j in 1:K))
+        @constraint(ldr, dual_ldr_row(probs, Φ, volume[t,:] .+ volume_hi[t,:] .- problem.hydro_capacity) .== 0)
+        @constraint(ldr, dual_ldr_row(probs, Φ, volume_lo[t,:] .- volume[t,:]) .== 0)
+        @constraint(ldr, dual_ldr_row(probs, Φ, hydro[t,:] .+ hydro_hi[t,:] .- problem.hydro_generation) .== 0)
+        @constraint(ldr, dual_ldr_row(probs, Φ, hydro_lo[t,:] .- hydro[t,:]) .== 0)
+        @constraint(ldr, dual_ldr_row(probs, Φ, spill_lo[t,:] .- spill[t,:]) .== 0)
         for i in 1:problem.termo_count
-            @constraint(ldr, [k=1:n_scen], termos[i,t,k] == sum(termos_ldr[i,t,j] * Φ[k,j] for j in 1:K))
+            @constraint(ldr, dual_ldr_row(probs, Φ,
+                termos[i,t,:] .+ termos_hi[i,t,:] .- problem.termo_generations[i]) .== 0)
+            @constraint(ldr, dual_ldr_row(probs, Φ, termos_lo[i,t,:] .- termos[i,t,:]) .== 0)
         end
     end
-    @constraint(ldr, [k=1:n_scen], θ[k] == sum(θ_ldr[j] * Φ[k,j] for j in 1:K))
+    @constraint(ldr, dual_ldr_row(probs, Φ, θ_lo .- θ) .== 0)
+    for i in 1:problem.cuts_count
+        @constraint(ldr, dual_ldr_row(probs, Φ,
+            cuts_slack[i,:] .+ problem.cuts_coeff[i] .* volume[T,:] .- θ .+ problem.cuts_inter[i]) .== 0)
+    end
 
     return ldr
 end
