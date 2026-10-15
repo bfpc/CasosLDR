@@ -356,7 +356,7 @@ function build_toy_problem(solver = default_solver)
     inflow_distr = truncated(Normal(60., 20.), 0., 120)
     cuts_coeff = [-300., -600., -1200., -2500., -7800.]
     cuts_inter = [75000., 135000., 210000., 310000., 390000.]
-    t_cost_coeffs = [121.30*0.51^2/2, 0., 0.]
+    t_cost_coeffs = [121.30, 0., 0.]
 
     return HydroProblem(
         h_generation,
