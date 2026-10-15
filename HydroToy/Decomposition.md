@@ -4,40 +4,36 @@
 rule* over a basis of functions of the inflows: every decision of stage $t$ is
 
 $$
-d_t(\xi) = \sum_{j=1}^{K} x^{d}_{t,j}\, \varphi_j(\xi),
+x^d_t(\xi) = \sum_{j=1}^{K} X^{d}_{t,j}\, \varphi_j(\xi),
 \qquad \varphi_1 \equiv 1,
 $$
 
-with one coefficient $x^d_{t,j}$ per decision, stage and basis function, and
-non-anticipativity fixing $x^d_{t,j} = 0$ whenever $\varphi_j$ depends on inflows
-revealed after stage $t$. `basis_function_ldr` writes this as a monolithic LP: one
-copy of the dispatch problem per sampled scenario, every copy tied to the same
-coefficients. With $\Phi_{kj} = \varphi_j(\xi^k)$ the basis matrix of the sample
-(`basis_values`) and $x$ the coefficients flattened (`ldr_coefficients`), the
-model is
+with one coefficient $X^{d}_{t,j}$ per decision, stage and basis function, and non-anticipativity fixing $X^{d}_{t,j} = 0$ whenever $\varphi_j$ depends on inflows revealed after stage $t$.
+`basis_function_ldr` writes this as a monolithic LP: one copy of the dispatch problem per sampled scenario, every copy tied to the same coefficients.
+With $\Phi_{kj} = \varphi_j(\xi^k)$ the basis matrix of the sample (`basis_values`) and $x$ the coefficients flattened (`ldr_coefficients`), the model is
 
 $$
-\min_x \; \sum_k p_k\, Q_k(x),
+\min_x \; \sum_k p_k\, Q_k(X),
 \qquad
-Q_k(x) = \begin{cases}
-\text{cost of scenario } k \text{ under the rule } x, \\
-+\infty & \text{if the rule is infeasible in scenario } k.
+Q_k(X) = \begin{cases}
+\text{cost of scenario $k$ under the rule $X$}, \\
+\text{$+\infty$ if the rule is infeasible in scenario $k$}.
 \end{cases}
 $$
 
 The coefficients are the only variables the scenarios share, so they are the
 natural first stage. Two decompositions of that split are implemented, and they
-are worth reading together because the second one exists as an answer to what
-measuring the first one showed.
+are worth reading together because the second one improves the first one.
 
 Both reproduce the monolithic optimum exactly — verified by
 `compare_basis_function_ldr`, which runs all of them on the same scenarios.
 
 ## What the split implies
 
-Fixing $x$ fixes *every* scenario variable: volume, hydro, spill, thermal and
-future cost are all values of the rule. The scenario subproblems therefore have
-**no recourse**. Two consequences drive everything below.
+Fixing $X$ fixes *every* scenario variable:
+volume, hydro, spill, thermal and future cost are all values of the rule,
+so the scenario subproblems have **no recourse**.
+This has two consequences:
 
 * A scenario's cost is an **affine function of the rule**, so pricing it is easy
   and its optimality cuts are exact almost immediately.
@@ -46,33 +42,33 @@ future cost are all values of the rule. The scenario subproblems therefore have
   Those include equalities, so the set of implementable rules is a polyhedron
   living in a proper affine subspace of the coefficient space.
 
-The work of decomposing this model is describing that polyhedron.
+The main difficulty of decomposing this model is describing that polyhedron.
 
 ## 1. Benders decomposition (`basis_function_ldr_benders`)
 
-Master: the coefficients $x$, plus one epigraph variable $\alpha_k \ge 0$ per
+Master: the coefficients $X$, plus one epigraph variable $\alpha_k \ge 0$ per
 scenario, minimizing $\sum_k p_k \alpha_k$.
 
 Subproblem (`basis_ldr_subproblem`), one per scenario, built once and re-solved:
-scenario $k$'s dispatch constraints, a **fixed copy** of $x$, and the coupling
+scenario $k$'s dispatch constraints, a **fixed copy** of $X$, and the coupling
 `decision == Σⱼ xⱼ Φₖⱼ` relaxed by non-negative slacks $s^\pm$. It is solved in
 two passes:
 
 | pass | slacks | objective | cut |
 | --- | --- | --- | --- |
-| feasibility | free | $\min \sum s^\pm$ | $0 \ge v + g'(x - \bar x)$ |
-| optimality | pinned to 0 | $\min \text{cost}$ | $\alpha_k \ge q + g'(x - \bar x)$ |
+| feasibility | free | $\min \sum s^\pm$ | $0 \ge v + g'(X - \bar X)$ |
+| optimality | pinned to 0 | $\min \text{cost}$ | $\alpha_k \ge q + g'(X - \bar X)$ |
 
-The feasibility pass measures the $L_1$ distance from the policy the rule
+The feasibility pass measures the $L^1$ distance from the policy the rule
 prescribes to scenario $k$'s feasible set, so it is always feasible and $v > 0$
 proves the rule is not implementable there. Both subgradients $g$ are read off
-`reduced_cost` of the fixed copy of $x$ (`subproblem_cut`), which lets JuMP do
+`reduced_cost` of the fixed copy of $X$ (`subproblem_cut`), which lets JuMP do
 the multiplication by $\Phi_{k\cdot}$ and keeps the cuts sparse by dropping the
 zero components.
 
-Validity: $v$ and $q$ are values of LPs parameterized by $x$ in their right-hand
+Validity: $v$ and $q$ are values of LPs parameterized by $X$ in their right-hand
 sides, so their optimal duals give affine minorants of the convex value
-functions — valid for every $x$, and tight at $\bar x$.
+functions — valid for every $X$, and tight at $\bar X$.
 
 **Convergence.** The master objective is a lower bound; the cost of a rule
 feasible in every scenario is an upper bound; the loop stops when they meet or
