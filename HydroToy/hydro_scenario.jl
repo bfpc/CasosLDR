@@ -522,7 +522,7 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    basis_ldr_subproblem(problem, T, K, inflow, basis, solver)
+    basis_ldr_subproblem(problem, T, inflow, basis, solver)
 
 The subproblem of one scenario: its dispatch constraints, a fixed copy of the
 decision-rule coefficients, and the slacks measuring the violation of the
@@ -532,9 +532,10 @@ coupling `decision == Σ_j coefficient_j * basis_j`.
 matrix (see `basis_values`).  `feasibility_mode!` and `optimality_mode!` switch
 the model between the two passes.
 """
-function basis_ldr_subproblem(problem::HydroProblem, T, K, inflow, basis, solver)
+function basis_ldr_subproblem(problem::HydroProblem, T, inflow, basis, solver)
     sub = Model(solver)
     set_silent(sub)
+    K = length(basis)
 
     # Scenario decisions, exactly as in the monolithic model
     @variables(sub, begin
@@ -682,7 +683,7 @@ function basis_function_ldr_benders(
     @objective(master, Min, sum(probs[k] * α[k] for k in 1:n_scen))
 
     # Second stage: one subproblem per scenario, built once and re-solved
-    subs = [basis_ldr_subproblem(problem, T, K, inflow[:,k], Φ[k,:], solver) for k in 1:n_scen]
+    subs = [basis_ldr_subproblem(problem, T, inflow[:,k], Φ[k,:], solver) for k in 1:n_scen]
 
     lower, upper = -Inf, Inf
     best, converged = nothing, false
@@ -813,12 +814,13 @@ end
 mean_basis(Φ, probs) = Φ' * probs
 
 """
-    set_ldr_objective!(model, problem, T, K, φ̄)
+    set_ldr_objective!(model, problem, T, φ̄)
 
 The expected cost of a rule, exactly: linear in the coefficients, with the mean
 basis vector `φ̄` of `mean_basis` carrying the whole sample.
 """
-function set_ldr_objective!(model, problem::HydroProblem, T, K, φ̄)
+function set_ldr_objective!(model, problem::HydroProblem, T, φ̄)
+    K = length(φ̄)
     termos_ldr, θ_ldr = model[:termos_ldr], model[:θ_ldr]
     @objective(model, Min,
         sum(problem.termo_costs[i] * termos_ldr[i,t,j] * φ̄[j]
@@ -828,14 +830,15 @@ function set_ldr_objective!(model, problem::HydroProblem, T, K, φ̄)
 end
 
 """
-    rule_values(problem, T, K, x, Φ)
+    rule_values(problem, T, x, Φ)
 
 The decisions the rule `x` -- coefficient values, flattened as
 `ldr_coefficients` orders them -- prescribes in every scenario of the basis
 matrix `Φ`, as one `n_scen x T` matrix per decision (a vector of them per
 thermal plant) and one `n_scen` vector of future costs.
 """
-function rule_values(problem::HydroProblem, T, K, x, Φ)
+function rule_values(problem::HydroProblem, T, x, Φ)
+    K = size(Φ, 2)
     c = reshape_coefficients(problem, T, K, x)
     return (;
         volume = Φ * c.volume_ldr',
@@ -886,14 +889,15 @@ function scenario_violation(problem::HydroProblem, T, decisions, inflow)
 end
 
 """
-    add_scenario_rows!(master, problem, T, K, inflow, basis; equalities)
+    add_scenario_rows!(master, problem, T, inflow, basis; equalities)
 
 Add one scenario's constraints, written in the coefficients alone: the bounds of
 every decision and the future-cost rows, plus -- when `equalities` is
 `:per_scenario` -- its water balance and demand rows.
 """
-function add_scenario_rows!(master, problem::HydroProblem, T, K, inflow, basis;
+function add_scenario_rows!(master, problem::HydroProblem, T, inflow, basis;
                             equalities = :per_scenario)
+    K = length(basis)
     volume_ldr, hydro_ldr, spill_ldr, termos_ldr, θ_ldr =
         master[:volume_ldr], master[:hydro_ldr], master[:spill_ldr],
         master[:termos_ldr], master[:θ_ldr]
@@ -921,7 +925,7 @@ function add_scenario_rows!(master, problem::HydroProblem, T, K, inflow, basis;
 end
 
 """
-    add_coefficientwise_equalities!(master, problem, T, K, Φ, inflow, stage_of_func)
+    add_coefficientwise_equalities!(master, problem, T, Φ, inflow, stage_of_func)
 
 Impose the water balance and the demand once per basis coefficient, so that they
 hold for every realization of the inflow and never have to be generated.
@@ -934,8 +938,9 @@ than merely wrong.  The representation is fitted by least squares over the
 admissible columns and its residual checked.  It holds for `bp2_functions` and
 `pw3_functions`, whose pieces sum back to the inflow of their stage.
 """
-function add_coefficientwise_equalities!(master, problem::HydroProblem, T, K, Φ, inflow,
+function add_coefficientwise_equalities!(master, problem::HydroProblem, T, Φ, inflow,
                                          stage_of_func)
+    K = size(Φ, 2)
     r = zeros(T, K)
     for t in 1:T
         available = [1; 1 .+ findall(<=(t), stage_of_func)]
@@ -1027,14 +1032,14 @@ function basis_function_ldr_scenario_generation(
     x = add_ldr_coefficients!(master, problem, T, K)
     fix_nonanticipativity!(master, problem, stage_of_func, T)
     φ̄ = mean_basis(Φ, probs)
-    set_ldr_objective!(master, problem, T, K, φ̄)
+    set_ldr_objective!(master, problem, T, φ̄)
 
     # With the equalities imposed for every realization the master is a
     # relaxation of the sampled model only if the sample cannot tell the two
     # formulations apart, which is what full column rank of Φ says.
     bounding = true
     if equalities === :coefficientwise
-        add_coefficientwise_equalities!(master, problem, T, K, Φ, inflow, stage_of_func)
+        add_coefficientwise_equalities!(master, problem, T, Φ, inflow, stage_of_func)
         bounding = rank(Φ) == K
     end
 
@@ -1043,14 +1048,14 @@ function basis_function_ldr_scenario_generation(
     # mean basis vector and the mean inflow.  Adding it up front keeps the master
     # bounded (thermal generation and future cost are non-negative),
     # which no working set of scenarios is guaranteed to do on its own.
-    add_scenario_rows!(master, problem, T, K, inflow * probs, φ̄; equalities)
+    add_scenario_rows!(master, problem, T, inflow * probs, φ̄; equalities)
 
     added = falses(n_scen)
     function activate!(candidates)
         activated = 0
         for k in candidates
             added[k] && continue
-            add_scenario_rows!(master, problem, T, K, inflow[:,k], Φ[k,:]; equalities)
+            add_scenario_rows!(master, problem, T, inflow[:,k], Φ[k,:]; equalities)
             added[k] = true
             activated += 1
         end
@@ -1086,7 +1091,7 @@ function basis_function_ldr_scenario_generation(
         lower = bounding ? objective : -Inf
         x̄ = value.(x)
 
-        violation = scenario_violation(problem, T, rule_values(problem, T, K, x̄, Φ), inflow)
+        violation = scenario_violation(problem, T, rule_values(problem, T, x̄, Φ), inflow)
         worst = maximum(violation)
         verbose && println("round $iteration: objective $(round(objective; digits=2)), " *
             "$(count(added)) of $n_scen scenarios, " *
