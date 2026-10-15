@@ -231,6 +231,253 @@ feasibility cuts, and rows do that job better than cuts. Benders would come into
 its own if the scenario subproblems gained genuine recourse — decisions that the
 rule does not determine.
 
+# Decomposing the *dual* LDR
+
+`Dual_scenarios.tex` restricts the Lagrange multiplier of the canonical form to
+a rule, $z(\xi) = Z L(\xi)$, instead of the decisions. Each row of
+$A x(\xi) + s(\xi) = b(\xi)$ then only has to hold on average against every
+basis function, which gives a **lower** bound on the sampled problem —
+dual to the upper bound above. In the sample it is one LP with every scenario's
+variables and only $m \ell$ coupling rows:
+
+$$
+\min_{x,\,s \ge 0} \; \frac{1}{K}\sum_k c^\top x(\xi_k)
+\quad\text{s.t.}\quad
+\sum_k \big(A x(\xi_k) + s(\xi_k) - b(\xi_k)\big) L(\xi_k)^\top = 0 .
+$$
+
+## 3. What does *not* work: cutting the moments
+
+The obvious split puts the moment matrices $M_x, M_s$ in the master (the only
+thing the coupling rows and the objective see) and asks a subproblem whether
+they are achievable by actual scenario variables. It does not converge, and not
+for want of tuning: the achievable moments of a single family of decisions,
+say $0 \le h(\xi_k) \le \bar H$, are
+
+$$
+\Big\{\, \tfrac1K \textstyle\sum_k h_k \Phi[k,:] \;:\; h_k \in [0,\bar H] \,\Big\} \subset \mathbb{R}^{\ell},
+$$
+
+a Minkowski sum of $K$ segments — a **zonotope** with $K$ generators, whose
+facets number $O\!\big(\binom{K-1}{\ell-1}\big)$, about $10^9$ for $K=100$,
+$\ell=7$. `add_compact_moment_bounds!` is exactly its bounding box, and one
+aggregated L1 feasibility cut per iteration never gets appreciably past that
+box: the bound sits at the expected-value solution however long the loop runs.
+`basis_function_dual_ldr_benders` and `basis_function_dual_ldr_compact_benders`
+are kept because that is worth knowing, not because they work.
+
+A zonotope has no usable facet description — but its *support function* is
+closed form, which says to work on the dual side instead.
+
+## 4. Lagrangian cutting planes (`basis_function_dual_ldr_lagrangian`)
+
+Dualizing the coupling rows with $Z$ — where $Z$ came from in the first place —
+separates the sample completely:
+
+$$
+\text{value} = \max_Z \; \frac1K \sum_k \varphi_k\big(Z L(\xi_k)\big),
+\qquad
+\varphi_k(z) = \min_{y_k \in Y_k}\Big[c^\top x(\xi_k) + z^\top\big(A y_k - b(\xi_k)\big)\Big],
+$$
+
+with $Y_k$ the box of `basis_function_dual_ldr_compact`. Because $Y_k$ *is* a
+box, `dual_ldr_scenario_lagrangian` evaluates $\varphi_k$ and its minimizer by
+arithmetic: every variable goes to the bound its reduced cost asks for, and a
+negative reduced cost on one of the variables unbounded above (`spill`, `θ`,
+`cuts_slack`) means $\varphi_k = -\infty$, i.e. $z$ is dual-infeasible for that
+scenario. Separation over the whole sample is one matrix product; no solver is
+called per scenario.
+
+Two things make this the right shape.
+
+* The supergradient is $\frac1K\sum_k (A y_k^\star - b(\xi_k)) L(\xi_k)^\top$ —
+  the moment residual. What decomposition 3 carried as *variables* is here a
+  gradient, and the moment matrices never need representing.
+* Every $Z$ is a feasible dual rule, so the Lagrangian is a **valid lower bound
+  at every iterate**, not only at convergence. The master's value is the upper
+  bound, and the two meet.
+
+The master is a Kelley model of that concave maximum: one epigraph variable per
+scenario (`cut_mode = :multi`), the dual-feasibility rows (`ray_mode`), and an
+L∞ trust region around the incumbent, scaled per basis function, which is what
+makes the early iterations — where the cut model is still unbounded above —
+mean anything. Two knobs matter at scale: `max_cuts`, because the epigraph of
+an outer model is above the Lagrangian nearly everywhere so "add the violated
+cuts" caps nothing on its own; and `ray_mode = :lazy`, because stating
+$K(T + \text{cuts} + 1)$ dual-feasibility rows up front is itself the expensive
+part past a few thousand scenarios.
+
+## 5. Scenario column generation (`basis_function_dual_ldr_column_generation`)
+
+The primal face of the same decomposition, and the mirror of decomposition 2:
+where that one starts from a few scenarios' *rows*, this starts from a few
+scenarios' *columns*. Requiring a scenario to satisfy $A y_k = b(\xi_k)$
+pointwise makes its contribution to every coupling row vanish, so for a working
+set $S$,
+
+$$
+\min \; \frac1K\sum_{k \in S} c^\top x(\xi_k) + \frac1K \sum_{k \notin S} v_k
+\quad\text{s.t.}\quad
+\sum_{k \in S}\big(A y_k - b(\xi_k)\big)L(\xi_k)^\top = 0,
+$$
+
+with $v_k$ the scenario's own deterministic optimum (`wait_and_see_values`), is
+a **restriction**: complete it with pointwise-feasible decisions outside $S$ and
+it is feasible for the full model at the same cost. Its value therefore comes
+*down* to the answer, and with $|S| = 1$ it starts exactly at the wait-and-see
+value. Pricing is the Lagrangian again: scenario $k \notin S$ has gap
+$v_k - \varphi_k(\bar Z L(\xi_k)) \ge 0$ for $\bar Z$ the coupling rows' duals
+(infinite when $\bar Z$ is dual-infeasible for it), and all gaps vanishing is
+the optimality certificate. The sign convention of those duals is settled by
+strong duality rather than guessed — see `coupling_multipliers`.
+
+Unlike the moment masters this one is always feasible and bounded, the constant
+alone bounding it below. But its iterates are *upper* bounds on a quantity
+whose point is to be a lower bound, so every round also reports the Lagrangian
+of its own multipliers, which is valid throughout.
+
+## Measured behaviour
+
+Toy problem, `T=3`, `bp2` basis, 100 scenarios, seed 7. The monolithic dual LDR
+is 93 163.31, and both decompositions reproduce it exactly:
+
+| method | value | time | work |
+| --- | --- | --- | --- |
+| monolithic | 93 163.31 | 0.03 s | — |
+| lagrangian, `:multi` + `:upfront` | 93 163.31 | 1.06 s | 16 iterations, 1 322 cuts, 900 rays |
+| lagrangian, `:multi` + `:lazy` | 93 163.31 | 0.44 s | 18 iterations, 1 193 cuts, 524 rays |
+| lagrangian, `:single` + `:upfront` | 90 911.23 | 0.59 s | 171 iterations, **not converged** |
+| lagrangian, `:single` + `:lazy` | 91 934.46 | 0.73 s | 286 iterations, **not converged** |
+| column generation, `max_add=1` | 93 163.31 | 1.90 s | 90 rounds, 90 of 100 scenarios |
+| column generation, `max_add=5` | 93 163.31 | 0.34 s | 20 rounds, 93 of 100 scenarios |
+| column generation, `max_add=25` | 93 163.31 | 0.07 s | 5 rounds, 100 of 100 scenarios |
+
+Every value that converged is the monolithic optimum to the last digit, from
+both sides: the Lagrangian's two bounds meet, and the column generation
+descends to it from the wait-and-see value (95 607.78 → 95 584 → 95 396 → … →
+93 163.31 over its 20 rounds, the last with no scenario mispriced).
+
+Three readings. The aggregated cut (`:single`) is far too weak — one cut per
+iteration for a sum of $K$ piecewise-linear terms — so `:multi` is the default,
+and `:single`'s value, while a perfectly valid lower bound, is simply the one it
+got to.
+
+The master LP is the *entire* cost of the Lagrangian method: with the trace on,
+scenario evaluation measures 0.000 s an iteration and cut building 0.005 s,
+against 0.05–0.2 s for the master. Which is also where the one sharp edge is:
+a cutting-plane master is the worst case for a dual simplex, and HiGHS's default
+choice stalls outright on the later, fatter ones — 30 s for a 2 000-row LP the
+primal simplex does in 0.05 s, with its interior-point and PDLP options not
+finishing at all. Hence `master_attributes` asking for the primal simplex,
+`prune_cuts!` dropping the rows priced at zero (644 of 900 at one stroke, on the
+`pw3` basis), and `master_time_limit` to bound what a stall can cost. None of
+that is needed for `bp2`; all of it is for `pw3`, and even then some of `pw3`'s
+masters still hit the limit. The consequence is worth being precise about,
+because it is asymmetric: `pw3`'s **bound is exact** — the Lagrangian reaches
+95 142.83, the monolithic optimum, at iteration 15 — but its **certificate is
+not**, since `ObjBound` only updates on a master solved to optimality, so the
+run ends on the stall limit with `converged = false` and `ObjBound = Inf`. A
+valid bound that cannot prove it is still a valid bound; take the certificate
+from `basis_function_dual_ldr_column_generation`, whose master is a small,
+well-behaved LP, and pair the two.
+
+The working set of the column generation, meanwhile, grows to **nearly the whole
+sample** — 93 of 100 here — which is the opposite of what happens in the primal
+(a few hundred scenarios out of a hundred thousand). That is structural, not a
+tuning failure:
+the dual LDR value is an average of every scenario's $\varphi_k$, and leaving
+scenario $k$ out replaces $\varphi_k(\bar Z L(\xi_k))$ by the strictly larger
+$v_k$ unless that scenario's pointwise problem happens to be optimal at
+$\bar Z$. Few are — though a richer basis prices more of them exactly, which is
+why `pw3` converges on 596 of 1 000 scenarios where `bp2` needs 997.
+
+## Scaling: what actually wins
+
+`bp2`, `T=3`, seed 7, against the monolith on the same samples:
+
+| scenarios | monolith (columns) | lagrangian | column generation |
+| --- | --- | --- | --- |
+| 100 | **0.37 s** (2 400) | 0.69 s, exact | 1.34 s, exact, 94 active |
+| 1 000 | **0.46 s** (24 000) | 18.8 s, exact | 22.2 s, 997 active, not conv. |
+| 10 000 | 78.9 s (240 000) | 267 s, 66 745 (not conv.) | **23.0 s**, bound 91 473.57 |
+| 100 000 | >18 min, abandoned (2.4 M) | — | **31.7 s**, bound 91 532.72 |
+
+Read this honestly, because it is not the result one expects. Up to a thousand
+scenarios **the monolith wins outright** and neither decomposition has any
+reason to exist: its rows are only the $m\ell$ coupling rows however many
+scenarios the columns come from, and HiGHS eats it. The dual LDR simply is not
+the kind of model that needs decomposing at those sizes.
+
+The crossover is around ten thousand, where the monolith's quarter-million
+columns cost 79 s. There the useful object is not either method's *certificate*
+but the column generation's **by-product**: the Lagrangian of its own
+multipliers, `ObjBound`, which is valid at every round. Truncated at 100 rounds
+it returns 91 473.57 in 23 s against the monolith's exact 91 535.30 in 79 s —
+within 0.07%, a third of the time — and at 100 000 scenarios, where the
+monolith's 2.4 M columns were abandoned after 18 minutes without an answer, it
+still returns 91 532.72 in 32 s. Stopping early is free here precisely because
+that bound needs no convergence to be valid.
+
+The `:multi` cutting plane is the one to avoid at scale: `max_cuts` caps it at
+1 000 cuts a round, so with 10 000 epigraph variables most scenarios never get a
+cut and the model of the Lagrangian is too poor to climb (66 745 after 267 s).
+It is the better method at a hundred scenarios and the worse one at ten
+thousand.
+
+## The bracket, and the ceiling
+
+`runner.jl` prints where every method falls (100 scenarios, `T=3`, seed 7):
+
+| | `bp2` ($\ell=7$) | `pw3` ($\ell=13$) |
+| --- | --- | --- |
+| EV, sample (dual LDR, constant basis) | 91 817.90 | 91 817.90 |
+| **dual LDR** | **93 163.31** | **95 142.83** |
+| WS, sample (perfect foresight) | 95 607.78 | 95 607.78 |
+| **primal LDR** | **104 382.87** | **97 613.60** |
+
+Both decompositions reproduce the dual LDR column exactly, on both bases.
+
+The wait-and-see value is the dual side's ceiling *by construction*: the
+canonical form of `Dual_scenarios.tex` puts no non-anticipativity on $x(\xi)$,
+so a basis rich enough to price every row scenario by scenario recovers the
+perfect-foresight problem exactly, and none can do better. With the constant
+basis alone the rows only have to hold on average and the value is the
+expected-value problem. So
+
+$$
+\text{EV} \;\le\; \text{dual LDR}(L) \;\le\; \text{WS} \;\le\; \text{true optimum} \;\le\; \text{primal LDR}(L),
+$$
+
+and the dual LDR interpolates between the two classical bounds — `pw3` already
+recovers three quarters of the EV–WS gap. Worth measuring before investing in
+any of this: if WS − EV is small, so is everything the dual side can win.
+Getting above WS needs measurability back among the dualized rows; see the last
+section of `Dual_scenarios.tex`.
+
+## Which to use, on the dual side
+
+Up to a few thousand scenarios, **the monolith** (`basis_function_dual_ldr_compact`).
+It is the fastest and it is exact, and the decompositions earn their keep only as
+an independent check on it — which they pass, from both sides, on both bases.
+
+Past that, **`basis_function_dual_ldr_column_generation`, stopped early**, and
+read `ObjBound` rather than `Obj`. Its restricted primal is a small
+well-behaved LP, its pricing is the closed-form Lagrangian, and that Lagrangian
+is a valid lower bound every round, so truncating it costs tightness and
+nothing else. This is the opposite of the primal side, where generation
+converges on a genuinely sparse active set; here the working set grows with the
+sample and the right move is to stop caring about convergence and take the
+bound.
+
+`basis_function_dual_ldr_lagrangian` is the most elegant of the three — no
+moment matrices, no LP per scenario, separation in $O(K)$ arithmetic — and the
+best at a hundred scenarios. It is also the one whose master is a degenerate
+cutting-plane LP, and that is what limits it. Worth reading for the structure;
+not what to run at scale.
+
+The two moment-based Benders decompositions are worth reading for the zonotope
+argument and nothing else.
+
 ## Reference
 
 | Function | |
@@ -242,6 +489,15 @@ rule does not determine.
 | `mean_basis`, `set_ldr_objective!`, `add_scenario_rows!`, `add_coefficientwise_equalities!`, `rule_values`, `scenario_violation` | its master rows and separation |
 | `basis_ldr_generation_solution` | a `run_comparison` row, used by `compare_methods` |
 | `compare_basis_function_ldr` | all of them on the same scenarios |
+| `basis_function_dual_ldr`, `basis_function_dual_ldr_compact` | the monolithic dual LDR, with a slack per row and with only the genuine ones |
+| `basis_function_dual_ldr_benders`, `basis_function_dual_ldr_compact_benders` | decomposition 3, the moment masters that do not converge |
+| `add_ms_moments!`, `add_compact_moments!`, `add_compact_moment_bounds!`, `dual_ldr_ms_subproblem`, `compact_moments_subproblem`, `dual_ldr_compact_moments` | their moments and achievability subproblems |
+| `basis_function_dual_ldr_lagrangian` | decomposition 4 |
+| `dual_ldr_scenario_lagrangian`, `dual_ldr_lagrangian`, `lagrangian_moment_residual`, `coupling_row_count`, `balance_row`, `demand_row`, `cut_row` | its closed-form evaluation and row layout |
+| `prune_cuts!`, `restricting` (both local to it) | the cut budget, and when the master's value is a bound |
+| `basis_function_dual_ldr_column_generation` | decomposition 5 |
+| `wait_and_see_values`, `dual_ldr_restricted_primal`, `coupling_multipliers` | its ceiling, master and pricing multipliers |
+| `dual_ldr_row` | the basis-weighted average shared by every dual formulation |
 | `sample_scenarios`, `inflow_matrix`, `basis_values`, `add_ldr_coefficients!`, `ldr_coefficients`, `reshape_coefficients`, `fix_nonanticipativity!` | shared by every formulation |
 
 Both decompositions return the `(; Obj, Bound, H₁, V₁, T₁, dt)` fields the other
