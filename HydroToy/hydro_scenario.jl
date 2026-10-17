@@ -5,8 +5,9 @@ function generate_extreme_points(problem, T)
     min_inflow = Distributions.minimum(problem.inflow_distr)
     max_inflow = Distributions.maximum(problem.inflow_distr)
 
-    # Recursion
-    scenarios = [initial]
+    # Recursion. Each scenario is itself a vector of per-stage inflows,
+    # so that `scenarios` is always a `Vector{Vector{Float64}}`.
+    scenarios = Vector{Float64}[[initial]]
     probs = [1.0]
     for t in 2:T
         new_scenarios = Vector{Float64}[]
@@ -24,67 +25,16 @@ function generate_extreme_points(problem, T)
 end
 
 
-function extreme_point_ldr(problem::HydroProblem, T=2)
-    ldr = Model(Ipopt.Optimizer)
-    set_silent(ldr)
+"""
+    extreme_point_ldr(problem; T = stage_count(problem), solver = HiGHS.Optimizer)
 
-    # Uncertainties: inflow
+The linear decision rule fitted on the extreme points of the uncertainty set:
+`basis_function_ldr` on the `2^(T-1)` scenarios of `generate_extreme_points`,
+weighted by their probabilities, with the basis `linear_basis(T)`.
+"""
+function extreme_point_ldr(problem::HydroProblem; T = stage_count(problem), solver = HiGHS.Optimizer)
     scenarios, probs = generate_extreme_points(problem, T)
-    inflow = inflow_matrix(scenarios) # each column is a scenario
-    n_vertices = size(inflow, 2)
-    # Decision variables
-    @variables(ldr, begin
-        0 <= volume[0:T,1:n_vertices] <= problem.hydro_capacity
-        0 <= hydro[1:T,1:n_vertices] <= problem.hydro_generation
-        0 <= spill[1:T,1:n_vertices]
-        0 <= termos[i=1:problem.termo_count, 1:T, 1:n_vertices] <= problem.termo_generations[i]
-    end)
-    # Future cost θ
-    @variable(ldr, θ[1:n_vertices] >= 0)
-
-    # Initial conditions
-    fix.(volume[0,1:n_vertices], problem.initial_volume; force=true)
-    # Stage decisions
-    for t in 1:T, k in 1:n_vertices
-        @constraint(ldr, volume[t,k] == volume[t-1,k] + inflow[t,k] - hydro[t,k] - spill[t,k])
-        @constraint(ldr, hydro[t,k] + sum(termos[:,t,k]) == problem.stage_demands[t])
-    end
-
-    # Future-cost function
-    for k in 1:n_vertices
-        @constraint(ldr, [i=1:problem.cuts_count], θ[k] >= problem.cuts_coeff[i] * volume[T,k] + problem.cuts_inter[i])
-    end
-    @objective(ldr, Min, sum(problem.termo_costs[i] * termos[i,t,k] * probs[k] for i in 1:problem.termo_count, t in 1:T, k in 1:n_vertices) + sum(θ[k] * probs[k] for k in 1:n_vertices))
-
-    # LDR decisions
-    @variables(ldr, begin
-        volume_ldr[1:T,1:2]
-        hydro_ldr[1:T,1:2]
-        spill_ldr[1:T,1:2]
-        termos_ldr[1:problem.termo_count, 1:T, 1:2]
-    end)
-    # NA constraints
-    for t in 1:T-1
-        fix.(volume_ldr[t,t+1:T], 0)
-        fix.(hydro_ldr[t,t+1:T], 0)
-        fix.(spill_ldr[t,t+1:T], 0)
-        for i in 1:problem.termo_count
-            fix.(termos_ldr[i,t,t+1:T], 0)
-        end
-    end
-    # LDR constraints
-    for t in 1:T
-        @constraint(ldr, [k=1:n_vertices], volume[t,k] == volume_ldr[t,1] + volume_ldr[t,2] * inflow[t,k])
-        @constraint(ldr, [k=1:n_vertices], hydro[t,k] == hydro_ldr[t,1] + hydro_ldr[t,2] * inflow[t,k])
-        @constraint(ldr, [k=1:n_vertices], spill[t,k] == spill_ldr[t,1] + spill_ldr[t,2] * inflow[t,k])
-        for i in 1:problem.termo_count
-            @constraint(ldr, [k=1:n_vertices], termos[i,t,k] == termos_ldr[i,t,1] + termos_ldr[i,t,2] * inflow[t,k])
-        end
-    end
-    @variable(ldr, θ_ldr[1:2])
-    @constraint(ldr, [k=1:n_vertices], θ[k] == θ_ldr[1] + θ_ldr[2] * inflow[T,k])
-
-    return ldr
+    return basis_function_ldr(Sample(problem, linear_basis(T); T, scenarios, probs); solver)
 end
 
 simple_functions = [
@@ -95,37 +45,73 @@ function pwl(x, xmin, xmax)
     return min(max(x - xmin, 0), xmax - xmin)
 end
 
-# PWlinear on each inflow, 2 breakpoints per inflow
-bp2_functions = [
-    x -> pwl(x[1], 0, 40),
-    x -> pwl(x[1], 40, 80),
-    x -> pwl(x[1], 80, 120),
-    x -> pwl(x[2], 0, 40),
-    x -> pwl(x[2], 40, 80),
-    x -> pwl(x[2], 80, 120)
-]
-bp2_stages = [repeat([2], 3); repeat([3], 3)]
+"""
+    Basis(functions, stages)
 
-# PWlinear on each inflow, and on the total inflow
-pw3_functions = [
-    bp2_functions...,
-    x -> pwl(x[1] + x[2], 0, 40),
-    x -> pwl(x[1] + x[2], 40, 80),
-    x -> pwl(x[1] + x[2], 80, 120),
-    x -> pwl(x[1] + x[2], 120, 160),
-    x -> pwl(x[1] + x[2], 160, 200),
-    x -> pwl(x[1] + x[2], 200, 240),
-]
-pw3_stages = [bp2_stages;  repeat([3], 6)]
+The basis functions of a decision rule, besides the constant term that every
+rule has.  `functions[j]` is evaluated on the inflows of stages `2:stages[j]`
+(so its argument `x[1]` is the stage-2 inflow), and only the decisions of stage
+`stages[j]` or later may use it (see `fix_nonanticipativity!`).
+"""
+struct Basis
+    functions::Vector{Function}
+    stages::Vector{Int}
+    function Basis(functions, stages)
+        length(functions) == length(stages) ||
+            throw(ArgumentError("$(length(functions)) basis functions but $(length(stages)) stages"))
+        return new(functions, stages)
+    end
+end
+
+"The constant term alone: rules that do not depend on the inflow."
+const CONSTANT_BASIS = Basis(Function[], Int[])
 
 """
-    sample_scenarios(problem, T, n_scen)
+    linear_basis(T)
+
+The inflow of every stage `2:T`, each as a basis function of its own stage: a
+rule linear in the inflow history.
+"""
+linear_basis(T) = Basis([x -> x[t-1] for t in 2:T], collect(2:T))
+
+"PWlinear on each inflow, 2 breakpoints per inflow"
+const BP2 = Basis(
+    [
+        x -> pwl(x[1], 0, 40),
+        x -> pwl(x[1], 40, 80),
+        x -> pwl(x[1], 80, 120),
+        x -> pwl(x[2], 0, 40),
+        x -> pwl(x[2], 40, 80),
+        x -> pwl(x[2], 80, 120),
+    ],
+    [repeat([2], 3); repeat([3], 3)],
+)
+
+"PWlinear on each inflow, and on the total inflow"
+const PW3 = Basis(
+    [
+        BP2.functions...,
+        x -> pwl(x[1] + x[2], 0, 40),
+        x -> pwl(x[1] + x[2], 40, 80),
+        x -> pwl(x[1] + x[2], 80, 120),
+        x -> pwl(x[1] + x[2], 120, 160),
+        x -> pwl(x[1] + x[2], 160, 200),
+        x -> pwl(x[1] + x[2], 200, 240),
+    ],
+    [BP2.stages; repeat([3], 6)],
+)
+
+"The number of stages of `problem`."
+stage_count(problem::HydroProblem) = length(problem.stage_demands)
+
+"""
+    sample_scenarios(problem, T, n_scen; rng = Random.default_rng())
 
 `n_scen` inflow scenarios of `T` stages: a deterministic first stage followed by
 independent draws of `problem.inflow_distr`.
 """
-sample_scenarios(problem::HydroProblem, T, n_scen) =
-    [[problem.initial_inflow; [rand(problem.inflow_distr) for t in 2:T]] for s in 1:n_scen]
+sample_scenarios(problem::HydroProblem, T, n_scen; rng = Random.default_rng()) =
+    [[problem.initial_inflow; [rand(rng, problem.inflow_distr) for t in 2:T]] for s in 1:n_scen]
 
 """
     inflow_matrix(scenarios)
@@ -135,18 +121,18 @@ The scenarios as a `T x n_scen` matrix, one column per scenario.
 inflow_matrix(scenarios) = reduce(hcat, scenarios)
 
 """
-    basis_values(functions, stage_of_func, inflow)
+    basis_values(basis, inflow)
 
-The `n_scen x (1 + length(functions))` matrix `Φ` of basis values, where
+The `n_scen x (1 + length(basis.functions))` matrix `Φ` of basis values, where
 `Φ[k,1] = 1` (the constant term of the decision rule) and `Φ[k,1+j]` is the
 `j`-th basis function evaluated on the inflows scenario `k` reveals up to its
-stage `stage_of_func[j]`.  A decision rule with coefficients `c[1:K]` then takes
+stage `basis.stages[j]`.  A decision rule with coefficients `c[1:K]` then takes
 the value `sum(c[j] * Φ[k,j] for j in 1:K)` in scenario `k`.
 """
-function basis_values(functions, stage_of_func, inflow)
+function basis_values(basis::Basis, inflow)
     n_scen = size(inflow, 2)
-    Φ = ones(n_scen, 1 + length(functions))
-    for (idx, (f, stage)) in enumerate(zip(functions, stage_of_func))
+    Φ = ones(n_scen, 1 + length(basis.functions))
+    for (idx, (f, stage)) in enumerate(zip(basis.functions, basis.stages))
         for k in 1:n_scen
             Φ[k, 1+idx] = f(inflow[2:stage, k])
         end
@@ -154,14 +140,106 @@ function basis_values(functions, stage_of_func, inflow)
     return Φ
 end
 
-"""
-    add_ldr_coefficients!(model, problem, T, K)
+"The mean basis vector `φ̄`, the only thing a rule's expected cost needs of the sample."
+mean_basis(Φ, probs) = Φ' * probs
 
-Declare the coefficients of the decision rules -- `K` per decision and stage --
-and return them as a flat vector. The Benders decomposition orders them the
-same way in the master problem and in every subproblem.
 """
-function add_ldr_coefficients!(model, problem::HydroProblem, T, K)
+    active_rank(Φ, probs)
+
+Effective `rank` of basis functions matrix `Φ`, considering only scenarios of positive probability.
+"""
+active_rank(Φ, probs) = rank(Φ[probs .> 0, :])
+
+"""
+    Sample(problem, basis; T = nothing, scenarios = 100, probs = nothing,
+           rng = Random.default_rng())
+
+Everything the scenario formulations of this file need of a sample, computed once:
+- the `T x n_scen` matrix `inflow` (one column per scenario),
+- the scenario probabilities `probs`,
+- the `n_scen x K` basis matrix `Φ` of `basis_values`, and
+- the mean basis vector `φ̄` of `mean_basis`,
+along with the `problem`, `basis` and horizon `T` they came from.
+
+`scenarios` is either a number of scenarios to draw from `rng` with
+`sample_scenarios`, or the scenarios themselves.
+`T` defaults to the length of the given scenarios, or, when `scenarios` is a number,
+to every stage of `problem`; either way it equals the number of stages `problem` actually has.
+`probs` defaults to uniform.
+"""
+struct Sample
+    problem::HydroProblem
+    basis::Basis
+    T::Int
+    inflow::Matrix{Float64}
+    probs::Vector{Float64}
+    Φ::Matrix{Float64}
+    φ̄::Vector{Float64}
+end
+
+function Sample(
+    problem::HydroProblem,
+    basis::Basis;
+    T = nothing,
+    scenarios = 100,
+    probs = nothing,
+    rng = Random.default_rng(),
+)
+    if T === nothing
+        if scenarios isa Integer
+            T = stage_count(problem)
+        else
+            isempty(scenarios) && throw(ArgumentError("need at least one scenario"))
+            T = length(first(scenarios))
+        end
+    end
+    1 <= T <= stage_count(problem) ||
+        throw(ArgumentError("T = $T, but the problem has $(stage_count(problem)) stages"))
+    maximum(basis.stages; init = 1) <= T ||
+        throw(ArgumentError("the basis uses inflows up to stage $(maximum(basis.stages)), past T = $T"))
+    scenarios isa Integer && (scenarios = sample_scenarios(problem, T, scenarios; rng))
+    all(scenario -> length(scenario) == T, scenarios) ||
+        throw(ArgumentError("every scenario must have T = $T inflows"))
+
+    n_scen = length(scenarios)
+    probs = something(probs, fill(1/n_scen, n_scen))
+    length(probs) == n_scen && all(>=(0), probs) && sum(probs) ≈ 1 ||
+        throw(ArgumentError("probs must be $n_scen nonnegative weights summing to one"))
+    inflow = inflow_matrix(scenarios) # each column is a scenario
+    Φ = basis_values(basis, inflow)
+    return Sample(problem, basis, T, inflow, probs, Φ, mean_basis(Φ, probs))
+end
+
+"The number of scenarios of `s`."
+scenario_count(s::Sample) = length(s.probs)
+"The number of coefficients `K` of every decision rule over `s`, the constant term included."
+basis_count(s::Sample) = size(s.Φ, 2)
+
+"""
+    subsample(s, scenarios)
+
+The scenarios of `s` indexed by `scenarios` -- a vector of indices or a
+`BitVector`, never a single scenario, which this would silently drop a
+dimension from.  They keep their probabilities in the whole sample, which
+therefore no longer sum to one.
+"""
+function subsample(s::Sample, scenarios)
+    scenarios isa Integer &&
+        throw(ArgumentError("subsample needs a collection of scenario indices, not a single one"))
+    return Sample(s.problem, s.basis, s.T, s.inflow[:,scenarios], s.probs[scenarios],
+           s.Φ[scenarios,:], mean_basis(s.Φ[scenarios,:], s.probs[scenarios]))
+end
+
+"""
+    add_ldr_coefficients!(model, s)
+
+Declare the coefficients of the decision rules -- `basis_count(s)` per decision
+and stage -- and return them as a flat vector. The Benders decomposition orders
+them the same way in the master problem and in every subproblem.
+"""
+function add_ldr_coefficients!(model, s::Sample)
+    (; problem, T) = s
+    K = basis_count(s)
     @variables(model, begin
         volume_ldr[1:T,1:K]
         hydro_ldr[1:T,1:K]
@@ -181,8 +259,10 @@ ldr_coefficients(model) = [
     vec(model[:θ_ldr])
 ]
 
-"Undo the flattening of `ldr_coefficients` on a vector of coefficient values."
-function reshape_coefficients(problem::HydroProblem, T, K, x)
+"Undo the flattening of `ldr_coefficients` on a vector `x` of coefficient values."
+function reshape_coefficients(s::Sample, x)
+    (; problem, T) = s
+    K = basis_count(s)
     offset = 0
     next(dims...) = begin
         block = reshape(x[offset .+ (1:prod(dims))], dims...)
@@ -199,14 +279,15 @@ function reshape_coefficients(problem::HydroProblem, T, K, x)
 end
 
 """
-    fix_nonanticipativity!(model, problem, stage_of_func, T)
+    fix_nonanticipativity!(model, s)
 
 Zero the coefficients of the basis functions that a stage-`t` decision may not
 use, because they depend on inflows revealed only later.
 """
-function fix_nonanticipativity!(model, problem::HydroProblem, stage_of_func, T)
+function fix_nonanticipativity!(model, s::Sample)
+    (; problem, T) = s
     for t in 1:T-1
-        for (idx, stage) in enumerate(stage_of_func)
+        for (idx, stage) in enumerate(s.basis.stages)
             if t < stage
                 fix(model[:volume_ldr][t,1+idx], 0)
                 fix(model[:hydro_ldr][t,1+idx], 0)
@@ -220,15 +301,19 @@ function fix_nonanticipativity!(model, problem::HydroProblem, stage_of_func, T)
     return model
 end
 
-function basis_function_ldr(problem::HydroProblem, functions, stage_of_func; T=2, solver=HiGHS.Optimizer, n_scen=100, scenarios=nothing)
+"""
+    basis_function_ldr(s; solver = HiGHS.Optimizer)
+
+The decision rule spanned by the basis of the sample `s`, fitted on its
+scenarios: one copy of the dispatch problem per scenario, every copy tied to the
+same rule coefficients.  Returns the model, unsolved.
+"""
+function basis_function_ldr(s::Sample; solver = HiGHS.Optimizer)
     ldr = Model(solver)
     set_silent(ldr)
 
-    # Uncertainties: inflow
-    scenarios = something(scenarios, sample_scenarios(problem, T, n_scen))
-    n_scen = length(scenarios)
-    probs = fill(1/n_scen, n_scen)
-    inflow = inflow_matrix(scenarios) # each column is a scenario
+    (; problem, T, inflow, probs, Φ) = s
+    n_scen = scenario_count(s)
     # Decision variables
     @variables(ldr, begin
         0 <= volume[0:T,1:n_scen] <= problem.hydro_capacity
@@ -254,13 +339,12 @@ function basis_function_ldr(problem::HydroProblem, functions, stage_of_func; T=2
     @objective(ldr, Min, sum(problem.termo_costs[i] * termos[i,t,k] * probs[k] for i in 1:problem.termo_count, t in 1:T, k in 1:n_scen) + sum(θ[k] * probs[k] for k in 1:n_scen))
 
     # Basis LDR decisions
-    Φ = basis_values(functions, stage_of_func, inflow)
-    K = size(Φ, 2)
-    add_ldr_coefficients!(ldr, problem, T, K)
+    K = basis_count(s)
+    add_ldr_coefficients!(ldr, s)
     volume_ldr, hydro_ldr, spill_ldr, termos_ldr, θ_ldr =
         ldr[:volume_ldr], ldr[:hydro_ldr], ldr[:spill_ldr], ldr[:termos_ldr], ldr[:θ_ldr]
     # NA constraints
-    fix_nonanticipativity!(ldr, problem, stage_of_func, T)
+    fix_nonanticipativity!(ldr, s)
     # LDR constraints
     for t in 1:T
         @constraint(ldr, [k=1:n_scen], volume[t,k] == sum(volume_ldr[t,j] * Φ[k,j] for j in 1:K))
@@ -284,12 +368,13 @@ scenario expansion of the dual LDR (`Dual_scenarios.tex`, eq. 93) sets to zero
 for every row of the canonical form `A x(ξ) + s(ξ) = b(ξ)`.
 """
 dual_ldr_row(probs, Φ, row) = Φ' * (probs .* row)
+dual_ldr_row(s::Sample, row) = dual_ldr_row(s.probs, s.Φ, row)
 
 """
-    basis_function_dual_ldr(problem, functions, stage_of_func; T=2, solver=HiGHS.Optimizer, n_scen=100, scenarios=nothing)
+    basis_function_dual_ldr(s; solver = HiGHS.Optimizer)
 
-Monolithic scenario expansion of the dual linear decision rule of `problem`
-(`Dual_scenarios.tex`, "Scenario expansion"). Where `basis_function_ldr`
+Monolithic scenario expansion of the dual linear decision rule over the sample
+`s` (`Dual_scenarios.tex`, "Scenario expansion"). Where `basis_function_ldr`
 restricts the *primal* decisions to a rule and keeps every dispatch constraint
 exact, scenario by scenario, this restricts the *dual* multiplier instead,
 `z(ξ) = Z·L(ξ)`, and leaves the primal scenario variables `x(ξ_k)`, `s(ξ_k)`
@@ -309,18 +394,12 @@ future-cost cuts -- becomes an equality against a slack `≥ 0`; the water
 balance and the demand balance, already equalities, get none. Accepts the same
 arguments as `basis_function_ldr`.
 """
-function basis_function_dual_ldr(problem::HydroProblem, functions, stage_of_func; T=2, solver=HiGHS.Optimizer, n_scen=100, scenarios=nothing)
+function basis_function_dual_ldr(s::Sample; solver = HiGHS.Optimizer)
     ldr = Model(solver)
     set_silent(ldr)
 
-    # Uncertainties: inflow
-    scenarios = something(scenarios, sample_scenarios(problem, T, n_scen))
-    n_scen = length(scenarios)
-    probs = fill(1/n_scen, n_scen)
-    inflow = inflow_matrix(scenarios) # each column is a scenario
-
-    # Basis functions
-    Φ = basis_values(functions, stage_of_func, inflow)
+    (; problem, T, inflow, probs, Φ) = s
+    n_scen = scenario_count(s)
 
     # Primal scenario variables x(ξ_k): free, their bounds become slack rows below
     @variables(ldr, begin
@@ -382,7 +461,7 @@ function basis_function_dual_ldr(problem::HydroProblem, functions, stage_of_func
 end
 
 """
-    basis_function_dual_ldr_compact(problem, functions, stage_of_func; T=2, solver=HiGHS.Optimizer, n_scen=100, scenarios=nothing)
+    basis_function_dual_ldr_compact(s; solver = HiGHS.Optimizer)
 
 A leaner scenario expansion of the dual LDR than `basis_function_dual_ldr`: a
 canonical-form row only needs a slack -- hence a dual multiplier for
@@ -411,18 +490,12 @@ enforces is also enforced (in one of the two forms) by `basis_function_dual_ldr`
 so solving it gives a lower bound at least as tight; see
 `dual_ldr_compact_moments` for reading `E[x(ξ)L(ξ)^T]` off the solution.
 """
-function basis_function_dual_ldr_compact(problem::HydroProblem, functions, stage_of_func; T=2, solver=HiGHS.Optimizer, n_scen=100, scenarios=nothing)
+function basis_function_dual_ldr_compact(s::Sample; solver = HiGHS.Optimizer)
     ldr = Model(solver)
     set_silent(ldr)
 
-    # Uncertainties: inflow
-    scenarios = something(scenarios, sample_scenarios(problem, T, n_scen))
-    n_scen = length(scenarios)
-    probs = fill(1/n_scen, n_scen)
-    inflow = inflow_matrix(scenarios) # each column is a scenario
-
-    # Basis functions
-    Φ = basis_values(functions, stage_of_func, inflow)
+    (; problem, T, inflow, probs, Φ) = s
+    n_scen = scenario_count(s)
 
     # Primal scenario variables x(ξ_k), bounded exactly as in basis_function_ldr:
     # no slack for a bound that x already carries directly.
@@ -460,19 +533,20 @@ function basis_function_dual_ldr_compact(problem::HydroProblem, functions, stage
 end
 
 """
-    dual_ldr_compact_moments(model, Φ, probs)
+    dual_ldr_compact_moments(model, s)
 
-`M_x = E[x(ξ)L(ξ)^T]` of a solved `basis_function_dual_ldr_compact`: the
-basis-weighted average of every scenario's `volume`, `hydro`, `spill`,
-`termos` and `θ`, one `... x size(Φ,2)` matrix per decision. Unlike
+`M_x = E[x(ξ)L(ξ)^T]` of a `basis_function_dual_ldr_compact` model built on
+the sample `s` and solved: the basis-weighted average of every scenario's
+`volume`, `hydro`, `spill`, `termos` and `θ`, one `... x basis_count(s)` matrix
+per decision. Unlike
 `basis_function_ldr`'s rule, `x(ξ_k)` here is never forced to equal this
 combination -- individual scenarios are free to deviate from it, which is the
 source of the model's extra slack (see `basis_function_dual_ldr`'s docstring)
 -- so `M_x` is only the closest rule-shaped *summary* of the solution, not a
 policy the model guarantees is itself feasible.
 """
-function dual_ldr_compact_moments(model, Φ, probs)
-    moment(row) = dual_ldr_row(probs, Φ, row)
+function dual_ldr_compact_moments(model, s::Sample)
+    moment(row) = dual_ldr_row(s, row)
     volume, hydro, spill, termos, θ = model[:volume], model[:hydro], model[:spill], model[:termos], model[:θ]
     T = size(volume, 1)
     termo_count = size(termos, 1)
@@ -522,20 +596,20 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    basis_ldr_subproblem(problem, T, inflow, basis, solver)
+    basis_ldr_subproblem(s, k; solver = HiGHS.Optimizer)
 
-The subproblem of one scenario: its dispatch constraints, a fixed copy of the
-decision-rule coefficients, and the slacks measuring the violation of the
-coupling `decision == Σ_j coefficient_j * basis_j`.
+The subproblem of scenario `k` of the sample `s`: its dispatch constraints, a
+fixed copy of the decision-rule coefficients, and the slacks measuring the
+violation of the coupling `decision == Σ_j coefficient_j * Φ[k,j]`.
 
-`inflow` is the scenario's inflow per stage and `basis` its row of the basis
-matrix (see `basis_values`).  `feasibility_mode!` and `optimality_mode!` switch
-the model between the two passes.
+`feasibility_mode!` and `optimality_mode!` switch the model between the two passes.
 """
-function basis_ldr_subproblem(problem::HydroProblem, T, inflow, basis, solver)
+function basis_ldr_subproblem(s::Sample, k; solver = HiGHS.Optimizer)
     sub = Model(solver)
     set_silent(sub)
-    K = length(basis)
+    (; problem, T) = s
+    inflow, basis = s.inflow[:,k], s.Φ[k,:]
+    K = basis_count(s)
 
     # Scenario decisions, exactly as in the monolithic model
     @variables(sub, begin
@@ -553,7 +627,7 @@ function basis_ldr_subproblem(problem::HydroProblem, T, inflow, basis, solver)
     @constraint(sub, [i=1:problem.cuts_count], θ >= problem.cuts_coeff[i] * volume[T] + problem.cuts_inter[i])
 
     # Copy of the first-stage variables, fixed to the master solution each iteration
-    params = add_ldr_coefficients!(sub, problem, T, K)
+    params = add_ldr_coefficients!(sub, s)
     fix.(params, 0.0)
 
     # Coupling to the decision rule, relaxed by slacks (positive and negative
@@ -629,13 +703,12 @@ function subproblem_cut(value, sub, x, x̄)
 end
 
 """
-    basis_function_ldr_benders(problem, functions, stage_of_func; kwargs...)
+    basis_function_ldr_benders(s; kwargs...)
 
 Solve the model of `basis_function_ldr` by Benders decomposition: the
 decision-rule coefficients stay in a master problem and each scenario is solved
 separately, contributing a feasibility or an optimality cut (see the comment
-above).  Accepts the same `T`, `solver`, `n_scen` and `scenarios` as
-`basis_function_ldr`, plus
+above).  Accepts the same `solver` as `basis_function_ldr`, plus
 
   * `max_iterations`, `tol`: stop when the gap between the master bound and the
     best rule found is within `tol` (relative), or after so many iterations;
@@ -653,37 +726,27 @@ cuts of each kind, the fitted `coefficients`, and the `master` and `subproblems`
 models.  A rule found infeasible has `Obj = Inf` and `NaN` coefficients.
 """
 function basis_function_ldr_benders(
-    problem::HydroProblem,
-    functions,
-    stage_of_func;
-    T = 2,
+    s::Sample;
     solver = HiGHS.Optimizer,
-    n_scen = 100,
-    scenarios = nothing,
     max_iterations = 500,
     tol = 1e-6,
     feasibility_tol = 1e-6,
     verbose = false,
 )
-    # Uncertainties: inflow
-    scenarios = something(scenarios, sample_scenarios(problem, T, n_scen))
-    n_scen = length(scenarios)
-    probs = fill(1/n_scen, n_scen)
-    inflow = inflow_matrix(scenarios) # each column is a scenario
-    Φ = basis_values(functions, stage_of_func, inflow)
-    K = size(Φ, 2)
+    probs = s.probs
+    n_scen = scenario_count(s)
 
     # First stage: the decision-rule coefficients, and one epigraph variable per
     # scenario (costs are non-negative, hence the lower bound of zero).
     master = Model(solver)
     set_silent(master)
-    x = add_ldr_coefficients!(master, problem, T, K)
-    fix_nonanticipativity!(master, problem, stage_of_func, T)
+    x = add_ldr_coefficients!(master, s)
+    fix_nonanticipativity!(master, s)
     @variable(master, α[1:n_scen] >= 0)
     @objective(master, Min, sum(probs[k] * α[k] for k in 1:n_scen))
 
     # Second stage: one subproblem per scenario, built once and re-solved
-    subs = [basis_ldr_subproblem(problem, T, inflow[:,k], Φ[k,:], solver) for k in 1:n_scen]
+    subs = [basis_ldr_subproblem(s, k; solver) for k in 1:n_scen]
 
     lower, upper = -Inf, Inf
     best, converged = nothing, false
@@ -761,7 +824,7 @@ function basis_function_ldr_benders(
         end
     end
 
-    coefficients = reshape_coefficients(problem, T, K, something(best, fill(NaN, length(x))))
+    coefficients = reshape_coefficients(s, something(best, fill(NaN, length(x))))
     return (;
         Obj = upper,
         ObjBound = lower,
@@ -801,9 +864,10 @@ end
 #     The objective is therefore a fixed linear function of the first-stage
 #     variables, and the master needs no epigraph and no optimality cuts;
 #   * M_x needs no feasibility subproblem either: with the basis matrix Φ of
-#     full column rank (checked below), M_x = (1/n_scen) X Φ can realize any
-#     target matrix from some free X, because right-multiplication by Φ is
-#     then surjective. A rank-deficient Φ would need the extra null-space rows
+#     full column rank on its positive-probability scenarios (checked below,
+#     `active_rank`), M_x = X diag(probs) Φ can realize any target matrix from
+#     some free X, because right-multiplication by diag(probs) Φ is then
+#     surjective. A rank-deficient Φ would need the extra null-space rows
 #     Dual_scenarios.tex describes for M_x (not implemented here).
 #
 # M_s is the one moment that needs a subproblem: not every matrix is the
@@ -818,14 +882,14 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    add_ms_moments!(model, problem, T, K)
+    add_ms_moments!(model, s)
 
 Declare the second-moment matrix `M_s` of `basis_function_dual_ldr` -- one
 `... x K` matrix per slack, laid out exactly like that model's slacks -- and
 return them flattened, in the order every other function of this decomposition
 uses.
 
-Every basis in this file (`bp2_functions`, `pw3_functions`, `simple_functions`,
+Every basis in this file (`BP2`, `PW3`, `simple_functions`,
 and the constant term) evaluates to a nonnegative quantity, so `M_s`, a moment
 of the nonnegative slacks against those functions, is itself entrywise
 nonnegative -- a cheap necessary condition of `rows of M_s ∈ cone L(ξ)`
@@ -836,7 +900,9 @@ need this bound dropped, and the master would then rely on the subproblem
 alone (far more cuts, if it converges in reasonable time at all -- the master
 is otherwise unbounded in every direction this bound would have blocked).
 """
-function add_ms_moments!(model, problem::HydroProblem, T, K)
+function add_ms_moments!(model, s::Sample)
+    (; problem, T) = s
+    K = basis_count(s)
     @variables(model, begin
         volume_hi_ms[1:T,1:K] >= 0
         volume_lo_ms[1:T,1:K] >= 0
@@ -862,7 +928,7 @@ ms_moments(model) = [
 ]
 
 """
-    dual_ldr_ms_subproblem(problem, T, Φ, probs, solver)
+    dual_ldr_ms_subproblem(s; solver = HiGHS.Optimizer)
 
 The feasibility subproblem of the dual-LDR decomposition: every scenario's
 slacks `s(ξ_k)`, and the gaps measuring how far the basis-weighted moment of
@@ -876,11 +942,12 @@ whether `M_s` is the moment of *some* nonnegative choice of `s(ξ_k)`.
 needs: its optimum is the L1 distance from the master's `M_s` to the set of
 achievable moments, `0` meaning some nonnegative `s(ξ_k)` realizes it exactly.
 """
-function dual_ldr_ms_subproblem(problem::HydroProblem, T, Φ, probs, solver)
+function dual_ldr_ms_subproblem(s::Sample; solver = HiGHS.Optimizer)
     sub = Model(solver)
     set_silent(sub)
-    n_scen = length(probs)
-    K = size(Φ, 2)
+    (; problem, T, probs, Φ) = s
+    n_scen = scenario_count(s)
+    K = basis_count(s)
 
     # Every scenario's slacks, exactly as in the monolithic model
     @variables(sub, begin
@@ -896,7 +963,7 @@ function dual_ldr_ms_subproblem(problem::HydroProblem, T, Φ, probs, solver)
     end)
 
     # Fixed copy of the master's M_s, refreshed every iteration
-    params = add_ms_moments!(sub, problem, T, K)
+    params = add_ms_moments!(sub, s)
     fix.(params, 0.0; force = true)
 
     # Gap between each M_s entry and the moment its scenario slacks realize,
@@ -949,14 +1016,14 @@ function dual_ldr_ms_subproblem(problem::HydroProblem, T, Φ, probs, solver)
 end
 
 """
-    basis_function_dual_ldr_benders(problem, functions, stage_of_func; kwargs...)
+    basis_function_dual_ldr_benders(s; kwargs...)
 
 Solve the model of `basis_function_dual_ldr` by Benders decomposition: the
 moment matrices `M_x` and `M_s` stay in a master problem, and a single
 feasibility subproblem (`dual_ldr_ms_subproblem`) checks whether the master's
 `M_s` is achievable by nonnegative scenario slacks, contributing a feasibility
-cut when it is not (see the comment above). Accepts the same `T`, `solver`,
-`n_scen` and `scenarios` as `basis_function_ldr`, plus
+cut when it is not (see the comment above). Accepts the same `solver` as
+`basis_function_ldr`, plus
 
   * `max_iterations`, `feasibility_tol`: stop when the subproblem's violation
     is within tolerance, or after so many iterations;
@@ -981,29 +1048,19 @@ violation instead means the ray is genuine, and the dual LDR really is
 unbounded below for this basis (see `basis_function_dual_ldr`'s docstring).
 """
 function basis_function_dual_ldr_benders(
-    problem::HydroProblem,
-    functions,
-    stage_of_func;
-    T = 2,
+    s::Sample;
     solver = HiGHS.Optimizer,
-    n_scen = 100,
-    scenarios = nothing,
     max_iterations = 500,
     feasibility_tol = 1e-6,
     verbose = false,
 )
-    # Uncertainties: inflow
-    scenarios = something(scenarios, sample_scenarios(problem, T, n_scen))
-    n_scen = length(scenarios)
-    probs = fill(1/n_scen, n_scen)
-    inflow = inflow_matrix(scenarios) # each column is a scenario
-    Φ = basis_values(functions, stage_of_func, inflow)
-    K = size(Φ, 2)
-    φ̄ = mean_basis(Φ, probs)
-    rank(Φ) == K || @warn "the basis matrix Φ is rank-deficient ($(rank(Φ)) < $K): " *
-        "M_x is then under-determined by the balance constraints alone, and would " *
-        "need the extra null-space rows Dual_scenarios.tex describes (not " *
-        "implemented here)."
+    (; problem, T, inflow, probs, Φ, φ̄) = s
+    K = basis_count(s)
+    r = active_rank(Φ, probs)
+    r == K || @warn "the basis matrix Φ is rank-deficient on the positive-probability " *
+        "scenarios ($r < $K): M_x is then under-determined by the balance constraints " *
+        "alone, and would need the extra null-space rows Dual_scenarios.tex describes " *
+        "(not implemented here)."
 
     # First stage: the moment matrices. Any M_x is achievable by some free
     # x(ξ_k) (see the comment above), so it needs no subproblem; M_s does, and
@@ -1017,7 +1074,7 @@ function basis_function_dual_ldr_benders(
         termos_mx[1:problem.termo_count,1:T,1:K]
         θ_mx[1:K]
     end)
-    Ms = add_ms_moments!(master, problem, T, K)
+    Ms = add_ms_moments!(master, s)
     volume_hi_ms, volume_lo_ms, hydro_hi_ms, hydro_lo_ms, spill_lo_ms, termos_hi_ms, termos_lo_ms, θ_lo_ms, cuts_ms =
         master[:volume_hi_ms], master[:volume_lo_ms], master[:hydro_hi_ms], master[:hydro_lo_ms],
         master[:spill_lo_ms], master[:termos_hi_ms], master[:termos_lo_ms], master[:θ_lo_ms], master[:cuts_ms]
@@ -1052,7 +1109,7 @@ function basis_function_dual_ldr_benders(
         θ_mx[1])
 
     # Second stage: one feasibility subproblem, covering every scenario
-    sub = dual_ldr_ms_subproblem(problem, T, Φ, probs, solver)
+    sub = dual_ldr_ms_subproblem(s; solver)
 
     lower = -Inf
     converged, iterations, cuts, dt = false, 0, 0, 0.0
@@ -1146,14 +1203,16 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    add_compact_moments!(model, problem, T, K)
+    add_compact_moments!(model, s)
 
 Declare the moment matrices of `basis_function_dual_ldr_compact`'s primal
 scenario variables -- `volume`, `hydro`, `spill`, `termos`, `θ`, and the one
 genuine slack `cuts_slack` -- each `... x K`, and return them as a named
 tuple.
 """
-function add_compact_moments!(model, problem::HydroProblem, T, K)
+function add_compact_moments!(model, s::Sample)
+    (; problem, T) = s
+    K = basis_count(s)
     @variables(model, begin
         volume_mx[1:T,1:K]
         hydro_mx[1:T,1:K]
@@ -1173,7 +1232,7 @@ compact_moments_flat(mts) =
     [vec(mts.volume_mx); vec(mts.hydro_mx); vec(mts.spill_mx); vec(mts.termos_mx); vec(mts.θ_mx); vec(mts.cuts_mx)]
 
 """
-    add_compact_moment_bounds!(model, mts, problem, φ̄)
+    add_compact_moment_bounds!(model, mts, s)
 
 The cheap, necessary bounds every row of `mts` obeys because every basis
 function in this file is nonnegative-valued: the moment of a variable that is
@@ -1188,7 +1247,8 @@ what let the master's objective (`Σ cost·termos_mx[:,:,1] + θ_mx[1]`, both
 terms now bounded below) never be unbounded, unlike the full-slack
 decomposition's master before any cut narrowed it down.
 """
-function add_compact_moment_bounds!(model, mts, problem::HydroProblem, φ̄)
+function add_compact_moment_bounds!(model, mts, s::Sample)
+    (; problem, φ̄) = s
     @constraint(model, mts.volume_mx .>= 0)
     @constraint(model, mts.volume_mx .<= problem.hydro_capacity .* φ̄')
     @constraint(model, mts.hydro_mx .>= 0)
@@ -1204,7 +1264,7 @@ function add_compact_moment_bounds!(model, mts, problem::HydroProblem, φ̄)
 end
 
 """
-    compact_moments_subproblem(problem, T, Φ, probs, solver)
+    compact_moments_subproblem(s; solver = HiGHS.Optimizer)
 
 The feasibility subproblem of the compact dual-LDR decomposition: every
 scenario's primal variables -- `volume`, `hydro`, `spill`, `termos` and `θ`,
@@ -1222,11 +1282,12 @@ Each family here is independent of the others, so nothing couples them beyond
 sharing the same L1 objective; `feasibility_mode!` (shared with the two other
 decompositions) is the only mode this needs.
 """
-function compact_moments_subproblem(problem::HydroProblem, T, Φ, probs, solver)
+function compact_moments_subproblem(s::Sample; solver = HiGHS.Optimizer)
     sub = Model(solver)
     set_silent(sub)
-    n_scen = length(probs)
-    K = size(Φ, 2)
+    (; problem, T, probs, Φ) = s
+    n_scen = scenario_count(s)
+    K = basis_count(s)
 
     # Every scenario's primal variables, exactly as in basis_function_ldr / _compact
     @variables(sub, begin
@@ -1239,7 +1300,7 @@ function compact_moments_subproblem(problem::HydroProblem, T, Φ, probs, solver)
     end)
 
     # Fixed copy of the master's moments, refreshed every iteration
-    mts = add_compact_moments!(sub, problem, T, K)
+    mts = add_compact_moments!(sub, s)
     params = compact_moments_flat(mts)
     fix.(params, 0.0; force = true)
 
@@ -1281,15 +1342,15 @@ function compact_moments_subproblem(problem::HydroProblem, T, Φ, probs, solver)
 end
 
 """
-    basis_function_dual_ldr_compact_benders(problem, functions, stage_of_func; kwargs...)
+    basis_function_dual_ldr_compact_benders(s; kwargs...)
 
 Solve the model of `basis_function_dual_ldr_compact` by Benders decomposition:
 the moment matrices stay in a master problem (linked by the exact algebraic
 relations of water balance, demand balance and the future-cost cuts), and a
 single feasibility subproblem (`compact_moments_subproblem`) checks whether
 they are jointly achievable by the primal scenario variables, contributing a
-feasibility cut when they are not. Accepts the same `T`, `solver`, `n_scen`
-and `scenarios` as `basis_function_ldr`, plus
+feasibility cut when they are not. Accepts the same `solver` as
+`basis_function_ldr`, plus
 
   * `max_iterations`, `feasibility_tol`: stop when the subproblem's violation
     is within tolerance, or after so many iterations;
@@ -1305,31 +1366,19 @@ Returns `(; Obj, dt)`, plus whether the loop `converged`, its `iterations`,
 the number of feasibility `cuts`, and the `master` and `subproblem` models.
 """
 function basis_function_dual_ldr_compact_benders(
-    problem::HydroProblem,
-    functions,
-    stage_of_func;
-    T = 2,
+    s::Sample;
     solver = HiGHS.Optimizer,
-    n_scen = 100,
-    scenarios = nothing,
     max_iterations = 500,
     feasibility_tol = 1e-6,
     verbose = false,
 )
-    # Uncertainties: inflow
-    scenarios = something(scenarios, sample_scenarios(problem, T, n_scen))
-    n_scen = length(scenarios)
-    probs = fill(1/n_scen, n_scen)
-    inflow = inflow_matrix(scenarios) # each column is a scenario
-    Φ = basis_values(functions, stage_of_func, inflow)
-    K = size(Φ, 2)
-    φ̄ = mean_basis(Φ, probs)
+    (; problem, T, inflow, probs, Φ, φ̄) = s
 
     # First stage: the moment matrices, bounded as described above
     master = Model(solver)
     set_silent(master)
-    mts = add_compact_moments!(master, problem, T, K)
-    add_compact_moment_bounds!(master, mts, problem, φ̄)
+    mts = add_compact_moments!(master, s)
+    add_compact_moment_bounds!(master, mts, s)
     Mflat = compact_moments_flat(mts)
     volume_mx, hydro_mx, spill_mx, termos_mx, θ_mx, cuts_mx =
         mts.volume_mx, mts.hydro_mx, mts.spill_mx, mts.termos_mx, mts.θ_mx, mts.cuts_mx
@@ -1352,7 +1401,7 @@ function basis_function_dual_ldr_compact_benders(
         θ_mx[1])
 
     # Second stage: one feasibility subproblem, covering every scenario
-    sub = compact_moments_subproblem(problem, T, Φ, probs, solver)
+    sub = compact_moments_subproblem(s; solver)
 
     lower = -Inf
     converged, iterations, cuts, dt = false, 0, 0, 0.0
@@ -1458,6 +1507,7 @@ end
 
 "The number of rows the compact dual LDR couples across scenarios: water balance and demand per stage, then the future-cost cuts."
 coupling_row_count(problem::HydroProblem, T) = 2T + problem.cuts_count
+coupling_row_count(s::Sample) = coupling_row_count(s.problem, s.T)
 
 "Row index of the stage-`t` water balance among the coupling rows."
 balance_row(T, t) = t
@@ -1467,11 +1517,11 @@ demand_row(T, t) = T + t
 cut_row(T, i) = 2T + i
 
 """
-    dual_ldr_scenario_lagrangian(problem, T, inflow, z)
+    dual_ldr_scenario_lagrangian(s, k, z; ray_tol = 1e-9)
 
-`φ_k(z)`, the Lagrangian of one scenario's dispatch problem at the multiplier
-`z = Z L(ξ_k)` (ordered as `balance_row`, `demand_row`, `cut_row`), and the
-minimizer attaining it.
+`φ_k(z)`, the Lagrangian of the dispatch problem of scenario `k` of the sample
+`s` at the multiplier `z = Z L(ξ_k)` (ordered as `balance_row`, `demand_row`,
+`cut_row`), and the minimizer attaining it.
 
 Since the scenario's variables are only box-constrained once the coupling rows
 are priced out, this needs no solver: each variable's reduced cost sends it to
@@ -1495,7 +1545,9 @@ Returns `(; value, cost, residual, rays, ...)` where `residual` is the
 scenario's row residual `A x + s - b` at the minimizer -- the supergradient
 this scenario contributes -- and `value = cost + z'residual`.
 """
-function dual_ldr_scenario_lagrangian(problem::HydroProblem, T, inflow, z; ray_tol = 1e-9)
+function dual_ldr_scenario_lagrangian(s::Sample, k, z; ray_tol = 1e-9)
+    (; problem, T) = s
+    inflow = view(s.inflow, :, k)
     nc = problem.cuts_count
     w = z[1:T]                      # water balance
     y = z[T+1:2T]                   # demand balance
@@ -1547,42 +1599,43 @@ function dual_ldr_scenario_lagrangian(problem::HydroProblem, T, inflow, z; ray_t
 end
 
 """
-    dual_ldr_lagrangian(problem, T, inflow, probs, Φ, Z)
+    dual_ldr_lagrangian(s, Z; ray_tol = 1e-9)
 
-The Lagrangian `Σ_k p_k φ_k(Z L(ξ_k))` of the whole sample at the dual decision
-rule `Z` -- a valid lower bound on the dual LDR value, hence on the sampled
-primal, for *any* `Z` -- together with every scenario's evaluation (see
+The Lagrangian `Σ_k p_k φ_k(Z L(ξ_k))` of the whole sample `s` at the dual
+decision rule `Z` -- a valid lower bound on the dual LDR value, hence on the
+sampled primal, for *any* `Z` -- together with every scenario's evaluation (see
 `dual_ldr_scenario_lagrangian`).  `-Inf` as soon as one scenario finds `Z`
 dual-infeasible.
 """
-function dual_ldr_lagrangian(problem::HydroProblem, T, inflow, probs, Φ, Z; ray_tol = 1e-9)
-    n_scen = length(probs)
-    zs = Z * Φ'   # column k is z(ξ_k) = Z L(ξ_k)
-    scenarios = [dual_ldr_scenario_lagrangian(problem, T, view(inflow,:,k), view(zs,:,k); ray_tol)
+function dual_ldr_lagrangian(s::Sample, Z; ray_tol = 1e-9)
+    probs = s.probs
+    n_scen = scenario_count(s)
+    zs = Z * s.Φ'   # column k is z(ξ_k) = Z L(ξ_k)
+    scenarios = [dual_ldr_scenario_lagrangian(s, k, view(zs,:,k); ray_tol)
                  for k in 1:n_scen]
-    value = all(s -> isfinite(s.value), scenarios) ?
+    value = all(scenario -> isfinite(scenario.value), scenarios) ?
         sum(probs[k] * scenarios[k].value for k in 1:n_scen) : -Inf
     return (; value, scenarios, zs)
 end
 
 """
-    lagrangian_moment_residual(probs, Φ, scenarios)
+    lagrangian_moment_residual(s, scenarios)
 
-`Σ_k p_k (A x(ξ_k) + s(ξ_k) - b(ξ_k)) L(ξ_k)'` at the Lagrangian minimizers: the
+`Σ_k p_k (A x(ξ_k) + s(ξ_k) - b(ξ_k)) L(ξ_k)'` at the Lagrangian minimizers
+`scenarios` (the field of the same name of `dual_ldr_lagrangian`): the
 supergradient of `dual_ldr_lagrangian` with respect to `Z`, which is exactly the
 moment residual the Benders masters carried as variables.  Requires every
 scenario to be dual-feasible.
 """
-lagrangian_moment_residual(probs, Φ, scenarios) =
-    sum(probs[k] .* scenarios[k].residual * Φ[k,:]' for k in eachindex(probs))
+lagrangian_moment_residual(s::Sample, scenarios) =
+    sum(s.probs[k] .* scenarios[k].residual * s.Φ[k,:]' for k in eachindex(s.probs))
 
 """
-    basis_function_dual_ldr_lagrangian(problem, functions, stage_of_func; kwargs...)
+    basis_function_dual_ldr_lagrangian(s; kwargs...)
 
 Solve the model of `basis_function_dual_ldr_compact` from the dual side, by
 cutting planes on the dual decision rule `Z` itself (see the comment above).
-Accepts the same `T`, `solver`, `n_scen` and `scenarios` as
-`basis_function_ldr`, plus
+Accepts the same `solver` as `basis_function_ldr`, plus
 
   * `cut_mode`: `:multi` keeps one epigraph variable per scenario, so every
     iteration adds `n_scen` cuts and the model of the Lagrangian is sharp;
@@ -1630,13 +1683,8 @@ matrix `Z` attaining `Obj`, whether the loop `converged`, its `iterations`, the
 number of `cuts` and `rays` generated, `dt`, and the `master` model.
 """
 function basis_function_dual_ldr_lagrangian(
-    problem::HydroProblem,
-    functions,
-    stage_of_func;
-    T = 2,
+    s::Sample;
     solver = HiGHS.Optimizer,
-    n_scen = 100,
-    scenarios = nothing,
     cut_mode = :multi,
     ray_mode = :upfront,
     max_cuts = 1_000,
@@ -1658,14 +1706,10 @@ function basis_function_dual_ldr_lagrangian(
     ray_mode in (:upfront, :lazy) ||
         throw(ArgumentError("ray_mode must be :upfront or :lazy"))
 
-    # Uncertainties: inflow
-    scenarios = something(scenarios, sample_scenarios(problem, T, n_scen))
-    n_scen = length(scenarios)
-    probs = fill(1/n_scen, n_scen)
-    inflow = inflow_matrix(scenarios) # each column is a scenario
-    Φ = basis_values(functions, stage_of_func, inflow)
-    K = size(Φ, 2)
-    nrows = coupling_row_count(problem, T)
+    (; problem, T, probs, Φ) = s
+    n_scen = scenario_count(s)
+    K = basis_count(s)
+    nrows = coupling_row_count(s)
 
     # The dual decision rule, one multiplier per coupling row and basis function
     master = Model(solver)
@@ -1688,10 +1732,10 @@ function basis_function_dual_ldr_lagrangian(
     cut_rows = Tuple{Any,Int,UInt64}[]
 
     "The cut a scenario's Lagrangian minimizer gives: φ_k(z) <= cost + z'residual for every z."
-    function scenario_cut(k, s, key)
+    function scenario_cut(k, scenario, key)
         row = @constraint(master, epi[k] <=
-            s.cost + sum(s.residual[r] * Φ[k,j] * Z[r,j]
-                         for r in 1:nrows, j in 1:K if s.residual[r] != 0))
+            scenario.cost + sum(scenario.residual[r] * Φ[k,j] * Z[r,j]
+                                for r in 1:nrows, j in 1:K if scenario.residual[r] != 0))
         push!(cut_rows, (row, k, key))
         return row
     end
@@ -1720,11 +1764,11 @@ function basis_function_dual_ldr_lagrangian(
             # unsolvable, and most of those rows are never binding.
             candidates = Tuple{Int,UInt64}[]
             for k in 1:n_scen
-                s = lag.scenarios[k]
-                isfinite(s.value) || continue
+                scenario = lag.scenarios[k]
+                isfinite(scenario.value) || continue
                 epigraph === nothing ||
-                    epigraph[k] > s.value + tol * (1 + abs(s.value)) || continue
-                key = cut_key(s.cost, s.residual)
+                    epigraph[k] > scenario.value + tol * (1 + abs(scenario.value)) || continue
+                key = cut_key(scenario.cost, scenario.residual)
                 new_cut(k, key) || continue
                 push!(candidates, (k, key))
             end
@@ -1738,7 +1782,7 @@ function basis_function_dual_ldr_lagrangian(
                 cuts += 1
             end
         elseif isfinite(lag.value)
-            R = lagrangian_moment_residual(probs, Φ, lag.scenarios)
+            R = lagrangian_moment_residual(s, lag.scenarios)
             cost = sum(probs[k] * lag.scenarios[k].cost for k in 1:n_scen)
             key = cut_key(cost, vec(R))
             if new_cut(1, key)
@@ -1878,7 +1922,7 @@ function basis_function_dual_ldr_lagrangian(
     # would be unbounded above
     dt = 0.0
     center = zeros(nrows, K)
-    lag = dual_ldr_lagrangian(problem, T, inflow, probs, Φ, center; ray_tol)
+    lag = dual_ldr_lagrangian(s, center; ray_tol)
     add_cuts!(lag)
     best, best_Z = lag.value, copy(center)
 
@@ -1918,8 +1962,7 @@ function basis_function_dual_ldr_lagrangian(
             (upper = min(upper, objective_value(master)))
         pruned = status == OPTIMAL ? prune_cuts!() : 0
 
-        eval_dt = @elapsed lag =
-            dual_ldr_lagrangian(problem, T, inflow, probs, Φ, Z̄; ray_tol)
+        eval_dt = @elapsed lag = dual_ldr_lagrangian(s, Z̄; ray_tol)
         cut_dt = @elapsed begin
             n_new_rays = add_rays!(lag)
             add_cuts!(lag, epigraph)
@@ -2007,17 +2050,18 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    wait_and_see_values(problem, T, inflow; solver)
+    wait_and_see_values(s; solver = HiGHS.Optimizer)
 
-`v_k`, the optimal cost of every scenario solved on its own with perfect
+`v_k`, the optimal cost of every scenario of `s` solved on its own with perfect
 foresight, i.e. with its dispatch constraints imposed pointwise.  Their sample
 average is the wait-and-see value, which bounds the dual LDR value from above:
 the canonical form of `Dual_scenarios.tex` puts no non-anticipativity on
 `x(ξ)`, so a dual rule rich enough to enforce every row scenario by scenario
 recovers exactly the perfect-foresight problem, and no basis can do better.
 """
-function wait_and_see_values(problem::HydroProblem, T, inflow; solver = HiGHS.Optimizer)
-    n_scen = size(inflow, 2)
+function wait_and_see_values(s::Sample; solver = HiGHS.Optimizer)
+    (; problem, T, inflow) = s
+    n_scen = scenario_count(s)
     model = Model(solver)
     set_silent(model)
     @variables(model, begin
@@ -2052,23 +2096,25 @@ function wait_and_see_values(problem::HydroProblem, T, inflow; solver = HiGHS.Op
 end
 
 """
-    dual_ldr_restricted_primal(problem, T, inflow, Φ, probs, active, constant, solver)
+    dual_ldr_restricted_primal(s, active, constant; solver = HiGHS.Optimizer)
 
 The restricted primal of the scenario generation: the compact dual LDR of the
-scenarios in `active` alone -- their aggregate rows, weighted by the *whole*
-sample's `probs` so that the objective keeps its scale -- plus the `constant`
-that the scenarios left out contribute through their own deterministic optima.
+scenarios of `s` in `active` alone -- their aggregate rows, weighted by the
+*whole* sample's `probs` so that the objective keeps its scale (see
+`subsample`) -- plus the `constant` that the scenarios left out contribute
+through their own deterministic optima.
 
 Returns the model and the aggregate rows as a `coupling_row_count x K` matrix,
 whose duals are the dual decision rule (see `coupling_multipliers`).
 """
-function dual_ldr_restricted_primal(problem::HydroProblem, T, inflow, Φ, probs,
-                                    active, constant, solver)
+function dual_ldr_restricted_primal(s::Sample, active, constant; solver = HiGHS.Optimizer)
     model = Model(solver)
     set_silent(model)
+    (; problem, T) = s
     n_active = length(active)
-    K = size(Φ, 2)
-    p, Ψ, I = probs[active], Φ[active,:], inflow[:,active]
+    K = basis_count(s)
+    sub = subsample(s, active)
+    p, Ψ, I = sub.probs, sub.Φ, sub.inflow
 
     @variables(model, begin
         0 <= volume[1:T,1:n_active] <= problem.hydro_capacity
@@ -2123,14 +2169,13 @@ function coupling_multipliers(rows, target, lagrangian; tol = 1e-6)
 end
 
 """
-    basis_function_dual_ldr_column_generation(problem, functions, stage_of_func; kwargs...)
+    basis_function_dual_ldr_column_generation(s; kwargs...)
 
 Solve the model of `basis_function_dual_ldr_compact` by generating scenarios:
 a working set keeps its scenario blocks as variables and every other scenario is
 pinned to its own deterministic optimum, which grows the working set with the
 scenarios whose Lagrangian gap says they would lower the objective (see the
-comment above).  Accepts the same `T`, `solver`, `n_scen` and `scenarios` as
-`basis_function_ldr`, plus
+comment above).  Accepts the same `solver` as `basis_function_ldr`, plus
 
   * `initial`: the starting working set, one scenario by default -- which makes
     the first bound the wait-and-see value;
@@ -2147,40 +2192,29 @@ first round starts from, whether the loop `converged`, its `rounds`, the
 the last restricted `master`.
 """
 function basis_function_dual_ldr_column_generation(
-    problem::HydroProblem,
-    functions,
-    stage_of_func;
-    T = 2,
+    s::Sample;
     solver = HiGHS.Optimizer,
-    n_scen = 100,
-    scenarios = nothing,
     initial = nothing,
     max_add = 5,
     max_rounds = 100,
     tol = 1e-6,
     verbose = false,
 )
-    # Uncertainties: inflow
-    scenarios = something(scenarios, sample_scenarios(problem, T, n_scen))
-    n_scen = length(scenarios)
-    probs = fill(1/n_scen, n_scen)
-    inflow = inflow_matrix(scenarios) # each column is a scenario
-    Φ = basis_values(functions, stage_of_func, inflow)
-    K = size(Φ, 2)
+    probs = s.probs
+    n_scen = scenario_count(s)
 
-    dt = @elapsed v = wait_and_see_values(problem, T, inflow; solver)
+    dt = @elapsed v = wait_and_see_values(s; solver)
     wait_and_see = dot(probs, v)
 
     active = falses(n_scen)
     active[something(initial, [1])] .= true
 
     upper, lower, converged, rounds, gap = Inf, -Inf, false, 0, Inf
-    master, Z = nothing, zeros(coupling_row_count(problem, T), K)
+    master, Z = nothing, zeros(coupling_row_count(s), basis_count(s))
     for iteration in 1:max_rounds
         rounds = iteration
         constant = sum(probs[k] * v[k] for k in 1:n_scen if !active[k]; init = 0.0)
-        restricted = dual_ldr_restricted_primal(
-            problem, T, inflow, Φ, probs, findall(active), constant, solver)
+        restricted = dual_ldr_restricted_primal(s, findall(active), constant; solver)
         master = restricted.model
         dt += @elapsed optimize!(master)
         termination_status(master) == OPTIMAL ||
@@ -2191,12 +2225,11 @@ function basis_function_dual_ldr_column_generation(
         # decision rule, and the Lagrangian of the active scenarios alone is
         # what identifies their sign.
         Z = coupling_multipliers(restricted.rows, upper - constant,
-            Z -> dual_ldr_lagrangian(problem, T, inflow[:,active], probs[active],
-                                     Φ[active,:], Z).value)
+            Z -> dual_ldr_lagrangian(subsample(s, active), Z).value)
 
         # Pricing: the same Lagrangian, now over the whole sample -- a valid
         # lower bound as a by-product
-        lag = dual_ldr_lagrangian(problem, T, inflow, probs, Φ, Z)
+        lag = dual_ldr_lagrangian(s, Z)
         lower = max(lower, lag.value)
         gaps = [active[k] ? -Inf : v[k] - lag.scenarios[k].value for k in 1:n_scen]
         gap = maximum(gaps)
@@ -2265,17 +2298,16 @@ end
 # counts far past the reach of the monolithic model workable.
 # ---------------------------------------------------------------------------
 
-"The mean basis vector `φ̄`, the only thing the objective needs of the sample."
-mean_basis(Φ, probs) = Φ' * probs
-
 """
-    set_ldr_objective!(model, problem, T, φ̄)
+    set_ldr_objective!(model, s)
 
-The expected cost of a rule, exactly: linear in the coefficients, with the mean
-basis vector `φ̄` of `mean_basis` carrying the whole sample.
+The expected cost of a rule over the sample `s`, exactly: linear in the
+coefficients, with the mean basis vector `s.φ̄` (see `mean_basis`) carrying the
+whole sample.
 """
-function set_ldr_objective!(model, problem::HydroProblem, T, φ̄)
-    K = length(φ̄)
+function set_ldr_objective!(model, s::Sample)
+    (; problem, T, φ̄) = s
+    K = basis_count(s)
     termos_ldr, θ_ldr = model[:termos_ldr], model[:θ_ldr]
     @objective(model, Min,
         sum(problem.termo_costs[i] * termos_ldr[i,t,j] * φ̄[j]
@@ -2285,16 +2317,16 @@ function set_ldr_objective!(model, problem::HydroProblem, T, φ̄)
 end
 
 """
-    rule_values(problem, T, x, Φ)
+    rule_values(s, x)
 
 The decisions the rule `x` -- coefficient values, flattened as
-`ldr_coefficients` orders them -- prescribes in every scenario of the basis
-matrix `Φ`, as one `n_scen x T` matrix per decision (a vector of them per
-thermal plant) and one `n_scen` vector of future costs.
+`ldr_coefficients` orders them -- prescribes in every scenario of the sample
+`s`, as one `n_scen x T` matrix per decision (a vector of them per thermal
+plant) and one `n_scen` vector of future costs.
 """
-function rule_values(problem::HydroProblem, T, x, Φ)
-    K = size(Φ, 2)
-    c = reshape_coefficients(problem, T, K, x)
+function rule_values(s::Sample, x)
+    (; problem, Φ) = s
+    c = reshape_coefficients(s, x)
     return (;
         volume = Φ * c.volume_ldr',
         hydro = Φ * c.hydro_ldr',
@@ -2305,15 +2337,16 @@ function rule_values(problem::HydroProblem, T, x, Φ)
 end
 
 """
-    scenario_violation(problem, T, decisions, inflow)
+    scenario_violation(s, decisions)
 
-How far the decisions of `rule_values` are from feasible, scenario by scenario:
-the largest violation among the bounds, the water balance, the demand and the
-future-cost rows.  This is the separation step, and it is "just" arithmetic --
-the whole sample is checked without calling a solver.
+How far the decisions of `rule_values` are from feasible, scenario by scenario
+of the sample `s`: the largest violation among the bounds, the water balance,
+the demand and the future-cost rows.  This is the separation step, and it is
+"just" arithmetic -- the whole sample is checked without calling a solver.
 """
-function scenario_violation(problem::HydroProblem, T, decisions, inflow)
-    n_scen = size(inflow, 2)
+function scenario_violation(s::Sample, decisions)
+    (; problem, T, inflow) = s
+    n_scen = scenario_count(s)
     violation = zeros(n_scen)
     worst!(v) = violation .= max.(violation, v)
     above(value, bound) = max.(value .- bound, 0.0)
@@ -2344,14 +2377,17 @@ function scenario_violation(problem::HydroProblem, T, decisions, inflow)
 end
 
 """
-    add_scenario_rows!(master, problem, T, inflow, basis; equalities)
+    add_scenario_rows!(master, s, inflow, basis; equalities)
 
 Add one scenario's constraints, written in the coefficients alone: the bounds of
 every decision and the future-cost rows, plus -- when `equalities` is
-`:per_scenario` -- its water balance and demand rows.
+`:per_scenario` -- its water balance and demand rows.  `inflow` is the
+scenario's inflow per stage and `basis` its row of the basis matrix, which need
+not come from the sample `s` itself (see the aggregate rows of
+`basis_function_ldr_scenario_generation`).
 """
-function add_scenario_rows!(master, problem::HydroProblem, T, inflow, basis;
-                            equalities = :per_scenario)
+function add_scenario_rows!(master, s::Sample, inflow, basis; equalities = :per_scenario)
+    (; problem, T) = s
     K = length(basis)
     volume_ldr, hydro_ldr, spill_ldr, termos_ldr, θ_ldr =
         master[:volume_ldr], master[:hydro_ldr], master[:spill_ldr],
@@ -2380,7 +2416,7 @@ function add_scenario_rows!(master, problem::HydroProblem, T, inflow, basis;
 end
 
 """
-    add_coefficientwise_equalities!(master, problem, T, Φ, inflow, stage_of_func)
+    add_coefficientwise_equalities!(master, s)
 
 Impose the water balance and the demand once per basis coefficient, so that they
 hold for every realization of the inflow and never have to be generated.
@@ -2390,15 +2426,15 @@ that stage knows, `inflow[t,k] == Σ_j r[t,j] Φ[k,j]` with `r[t,j] = 0` for the
 functions of later stages -- non-anticipativity zeroes the coefficients such a
 row would talk about, so a representation using them would be infeasible rather
 than merely wrong.  The representation is fitted by least squares over the
-admissible columns and its residual checked.  It holds for `bp2_functions` and
-`pw3_functions`, whose pieces sum back to the inflow of their stage.
+admissible columns and its residual checked.  It holds for `BP2` and
+`PW3`, whose pieces sum back to the inflow of their stage.
 """
-function add_coefficientwise_equalities!(master, problem::HydroProblem, T, Φ, inflow,
-                                         stage_of_func)
-    K = size(Φ, 2)
+function add_coefficientwise_equalities!(master, s::Sample)
+    (; problem, T, inflow, Φ) = s
+    K = basis_count(s)
     r = zeros(T, K)
     for t in 1:T
-        available = [1; 1 .+ findall(<=(t), stage_of_func)]
+        available = [1; 1 .+ findall(<=(t), s.basis.stages)]
         r[t,available] = Φ[:,available] \ inflow[t,:]
         residual = maximum(abs, Φ * r[t,:] .- inflow[t,:])
         residual <= 1e-6 * max(1.0, maximum(abs, inflow[t,:])) || error(
@@ -2406,7 +2442,7 @@ function add_coefficientwise_equalities!(master, problem::HydroProblem, T, Φ, i
             "stages up to $t (residual $residual), so equalities = " *
             ":coefficientwise cannot hold for every realization; use " *
             ":per_scenario, or a basis that represents the inflow as " *
-            "bp2_functions does")
+            "BP2 does")
     end
     volume_ldr, hydro_ldr, spill_ldr, termos_ldr =
         master[:volume_ldr], master[:hydro_ldr], master[:spill_ldr], master[:termos_ldr]
@@ -2423,20 +2459,20 @@ function add_coefficientwise_equalities!(master, problem::HydroProblem, T, Φ, i
 end
 
 """
-    basis_function_ldr_scenario_generation(problem, functions, stage_of_func; kwargs...)
+    basis_function_ldr_scenario_generation(s; kwargs...)
 
 Solve the model of `basis_function_ldr` by scenario generation: a master problem
 over the decision-rule coefficients carries the exact objective of the whole
 sample and the rows of a working set of scenarios, which grows with the
 scenarios the current rule violates (see the comment above).  Accepts the same
-`T`, `solver`, `n_scen` and `scenarios` as `basis_function_ldr`, plus
+`solver` as `basis_function_ldr`, plus
 
   * `equalities`: `:per_scenario` generates the water balance and the demand
     with each scenario, and reproduces `basis_function_ldr` exactly;
     `:coefficientwise` imposes them for every realization up front, which is the
-    same model whenever `Φ` has full column rank and a stronger one when it does
-    not -- in which case the master is no longer a relaxation and no bound is
-    reported;
+    same model whenever `Φ` has full column rank on its positive-probability
+    scenarios (`active_rank`) and a stronger one when it does not -- in which
+    case the master is no longer a relaxation and no bound is reported;
   * `n_init`: size of the initial working set, `2K` by default -- a head start,
     not a necessity, since the aggregate rows keep the master bounded on their
     own.  A master the solver still fails on is widened by `n_init` scenarios at
@@ -2457,13 +2493,8 @@ sample estimate: the cost of a rule is affine, so the master objective at
 termination *is* the expected cost of the rule over the whole sample.
 """
 function basis_function_ldr_scenario_generation(
-    problem::HydroProblem,
-    functions,
-    stage_of_func;
-    T = 2,
+    s::Sample;
     solver = HiGHS.Optimizer,
-    n_scen = 100,
-    scenarios = nothing,
     equalities = :per_scenario,
     n_init = nothing,
     max_add = 10,
@@ -2474,28 +2505,24 @@ function basis_function_ldr_scenario_generation(
     equalities in (:per_scenario, :coefficientwise) ||
         throw(ArgumentError("equalities must be :per_scenario or :coefficientwise"))
 
-    # Uncertainties: inflow
-    scenarios = something(scenarios, sample_scenarios(problem, T, n_scen))
-    n_scen = length(scenarios)
-    probs = fill(1/n_scen, n_scen)
-    inflow = inflow_matrix(scenarios) # each column is a scenario
-    Φ = basis_values(functions, stage_of_func, inflow)
-    K = size(Φ, 2)
+    (; inflow, probs, Φ, φ̄) = s
+    n_scen = scenario_count(s)
+    K = basis_count(s)
 
     master = Model(solver)
     set_silent(master)
-    x = add_ldr_coefficients!(master, problem, T, K)
-    fix_nonanticipativity!(master, problem, stage_of_func, T)
-    φ̄ = mean_basis(Φ, probs)
-    set_ldr_objective!(master, problem, T, φ̄)
+    x = add_ldr_coefficients!(master, s)
+    fix_nonanticipativity!(master, s)
+    set_ldr_objective!(master, s)
 
     # With the equalities imposed for every realization the master is a
     # relaxation of the sampled model only if the sample cannot tell the two
-    # formulations apart, which is what full column rank of Φ says.
+    # formulations apart, which is what full column rank of Φ on its
+    # positive-probability scenarios says (`active_rank`).
     bounding = true
     if equalities === :coefficientwise
-        add_coefficientwise_equalities!(master, problem, T, Φ, inflow, stage_of_func)
-        bounding = rank(Φ) == K
+        add_coefficientwise_equalities!(master, s)
+        bounding = active_rank(Φ, probs) == K
     end
 
     # The sample average of the scenarios' rows: a convex combination of rows of
@@ -2503,14 +2530,14 @@ function basis_function_ldr_scenario_generation(
     # mean basis vector and the mean inflow.  Adding it up front keeps the master
     # bounded (thermal generation and future cost are non-negative),
     # which no working set of scenarios is guaranteed to do on its own.
-    add_scenario_rows!(master, problem, T, inflow * probs, φ̄; equalities)
+    add_scenario_rows!(master, s, inflow * probs, φ̄; equalities)
 
     added = falses(n_scen)
     function activate!(candidates)
         activated = 0
         for k in candidates
             added[k] && continue
-            add_scenario_rows!(master, problem, T, inflow[:,k], Φ[k,:]; equalities)
+            add_scenario_rows!(master, s, inflow[:,k], Φ[k,:]; equalities)
             added[k] = true
             activated += 1
         end
@@ -2546,7 +2573,7 @@ function basis_function_ldr_scenario_generation(
         lower = bounding ? objective : -Inf
         x̄ = value.(x)
 
-        violation = scenario_violation(problem, T, rule_values(problem, T, x̄, Φ), inflow)
+        violation = scenario_violation(s, rule_values(s, x̄))
         worst = maximum(violation)
         verbose && println("round $iteration: objective $(round(objective; digits=2)), " *
             "$(count(added)) of $n_scen scenarios, " *
@@ -2566,7 +2593,7 @@ function basis_function_ldr_scenario_generation(
         end
     end
 
-    coefficients = reshape_coefficients(problem, T, K, something(best, fill(NaN, length(x))))
+    coefficients = reshape_coefficients(s, something(best, fill(NaN, length(x))))
     return (;
         Obj = upper,
         ObjBound = lower,
@@ -2584,62 +2611,53 @@ function basis_function_ldr_scenario_generation(
 end
 
 """
-    basis_ldr_generation_solution(problem, functions, stage_of_func; kwargs...)
+    basis_ldr_generation_solution(problem, basis = BP2; T, scenarios = 100, rng, kwargs...)
 
-`basis_function_ldr_scenario_generation` reduced to the fields `run_comparison`
-tabulates, since every other field of the full result would become a column of
-the table -- a JuMP model among them.
+`basis_function_ldr_scenario_generation` on a fresh `Sample(problem, basis; T,
+scenarios, rng)`, reduced to the fields `run_comparison` tabulates, since every
+other field of the full result would become a column of the table -- a JuMP
+model among them.
 
-Meant for a 3-stage `problem`, hence `T = 3` and a basis of the same horizon:
-`evaluate_policy` scores the stage-2 and stage-3 recourse of the first-stage
-decisions, which a shorter horizon would leave out of the rule.
+Meant for the whole horizon of `problem`, hence the default `T =
+stage_count(problem)`: `evaluate_policy` scores the stage-2 and stage-3 recourse
+of the first-stage decisions, which a shorter horizon would leave out of the
+rule.
 """
 function basis_ldr_generation_solution(
     problem::HydroProblem,
-    functions = bp2_functions,
-    stage_of_func = bp2_stages;
-    T = 3,
+    basis = BP2;
+    T = stage_count(problem),
+    scenarios = 100,
+    rng = Random.default_rng(),
     kwargs...,
 )
-    sol = basis_function_ldr_scenario_generation(
-        problem, functions, stage_of_func; T, kwargs...
-    )
+    s = Sample(problem, basis; T, scenarios, rng)
+    sol = basis_function_ldr_scenario_generation(s; kwargs...)
     return (; sol.Obj, sol.Bound, sol.H₁, sol.V₁, sol.T₁, sol.dt)
 end
 
 """
-    compare_basis_function_ldr(problem, functions, stage_of_func; kwargs...)
+    compare_basis_function_ldr(s; kwargs...)
 
 Solve the monolithic basis-function LDR model, its Benders decomposition and its
-scenario generation in both equality modes, all on the same scenarios.  Keyword
+scenario generation in both equality modes, all on the sample `s`.  Keyword
 arguments of the two decompositions go in the `benders` and `generation` named
 tuples.
 """
 function compare_basis_function_ldr(
-    problem::HydroProblem,
-    functions,
-    stage_of_func;
-    T = 2,
-    n_scen = 20,
+    s::Sample;
     solver = HiGHS.Optimizer,
     verbose = false,
     benders = (;),
     generation = (;),
 )
-    scenarios = sample_scenarios(problem, T, n_scen)
-
-    full = basis_function_ldr(problem, functions, stage_of_func; T, solver, scenarios)
+    full = basis_function_ldr(s; solver)
     dt_full = @elapsed optimize!(full)
 
-    bend = basis_function_ldr_benders(
-        problem, functions, stage_of_func; T, solver, scenarios, verbose, benders...
-    )
-    gen = basis_function_ldr_scenario_generation(
-        problem, functions, stage_of_func; T, solver, scenarios, verbose, generation...
-    )
+    bend = basis_function_ldr_benders(s; solver, verbose, benders...)
+    gen = basis_function_ldr_scenario_generation(s; solver, verbose, generation...)
     gen_cw = basis_function_ldr_scenario_generation(
-        problem, functions, stage_of_func;
-        T, solver, scenarios, verbose, generation..., equalities = :coefficientwise
+        s; solver, verbose, generation..., equalities = :coefficientwise
     )
 
     return (;

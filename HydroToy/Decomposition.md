@@ -178,7 +178,7 @@ handled.
   coefficients such a row would talk about, so a representation using them is
   infeasible rather than merely wrong. The representation is fitted by least
   squares over the admissible columns and its residual checked. It is exact for
-  `bp2_functions` and `pw3_functions`, whose pieces sum back to the inflow of
+  `BP2` and `PW3`, whose pieces sum back to the inflow of
   their stage, $\text{pwl}(a,0,40) + \text{pwl}(a,40,80) + \text{pwl}(a,80,120) = a$
   on $[0,120]$.
 
@@ -498,6 +498,8 @@ argument and nothing else.
 | `basis_function_dual_ldr_column_generation` | decomposition 5 |
 | `wait_and_see_values`, `dual_ldr_restricted_primal`, `coupling_multipliers` | its ceiling, master and pricing multipliers |
 | `dual_ldr_row` | the basis-weighted average shared by every dual formulation |
+| `Basis`, `BP2`, `PW3`, `CONSTANT_BASIS`, `linear_basis` | the basis functions of a rule, with the stage each one belongs to |
+| `Sample`, `subsample` | a sample of scenarios with its probabilities, basis matrix and mean basis vector, built once and passed to every formulation |
 | `sample_scenarios`, `inflow_matrix`, `basis_values`, `add_ldr_coefficients!`, `ldr_coefficients`, `reshape_coefficients`, `fix_nonanticipativity!` | shared by every formulation |
 
 Both decompositions return the `(; Obj, Bound, H₁, V₁, T₁, dt)` fields the other
@@ -508,10 +510,10 @@ of its table.
 ```julia
 julia> problem = HydroToy3.build_toy_problem();
 
-julia> HydroToy3.compare_basis_function_ldr(problem, HydroToy3.bp2_functions,
-           HydroToy3.bp2_stages; T = 3, n_scen = 30)
+julia> HydroToy3.compare_basis_function_ldr(
+           HydroToy3.Sample(problem, HydroToy3.BP2; scenarios = 30))
 
-julia> HydroToy3.basis_function_ldr_scenario_generation(problem,
-           HydroToy3.pw3_functions, HydroToy3.pw3_stages;
-           T = 3, n_scen = 100_000, verbose = true)
+julia> HydroToy3.basis_function_ldr_scenario_generation(
+           HydroToy3.Sample(problem, HydroToy3.PW3; scenarios = 100_000);
+           verbose = true)
 ```
