@@ -454,6 +454,18 @@ any of this: if WS − EV is small, so is everything the dual side can win.
 Getting above WS needs measurability back among the dualized rows; see the last
 section of `Dual_scenarios.tex`.
 
+**This ceiling is a property of the formulation, not of dual decision rules.**
+It holds because the scenario expansion here lets *every* variable depend on the
+scenario. `LinearDecisionRules.jl` instead gives first-stage variables only
+their constant coefficient, so what its dual bound brackets is the true
+two-stage optimum, not WS — and it does overtake wait-and-see on problems with
+a large EVPI. The criterion is `gap(L) < EVPI`, and the worked examples (a
+two-point inflow, and a newsvendor where WS and EV coincide) are in
+`Dual_scenarios.tex`, §"Non-anticipativity, and when the ceiling does not
+apply". Lifting the ceiling *here* needs only the stage-1 variables tied across
+scenarios — `volume[1,k] == volume[1,1]` and friends, imposed pointwise rather
+than against the basis.
+
 ## Which to use, on the dual side
 
 Up to a few thousand scenarios, **the monolith** (`basis_function_dual_ldr_compact`).
