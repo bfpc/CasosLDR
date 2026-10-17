@@ -29,12 +29,12 @@ end
     extreme_point_ldr(problem; T = stage_count(problem), solver = HiGHS.Optimizer)
 
 The linear decision rule fitted on the extreme points of the uncertainty set:
-`basis_function_ldr` on the `2^(T-1)` scenarios of `generate_extreme_points`,
+`primal_ldr` on the `2^(T-1)` scenarios of `generate_extreme_points`,
 weighted by their probabilities, with the basis `linear_basis(T)`.
 """
 function extreme_point_ldr(problem::HydroProblem; T = stage_count(problem), solver = HiGHS.Optimizer)
     scenarios, probs = generate_extreme_points(problem, T)
-    return basis_function_ldr(Sample(problem, linear_basis(T); T, scenarios, probs); solver)
+    return primal_ldr(Sample(problem, linear_basis(T); T, scenarios, probs); solver)
 end
 
 simple_functions = [
@@ -302,13 +302,13 @@ function fix_nonanticipativity!(model, s::Sample)
 end
 
 """
-    basis_function_ldr(s; solver = HiGHS.Optimizer)
+    primal_ldr(s; solver = HiGHS.Optimizer)
 
 The decision rule spanned by the basis of the sample `s`, fitted on its
 scenarios: one copy of the dispatch problem per scenario, every copy tied to the
 same rule coefficients.  Returns the model, unsolved.
 """
-function basis_function_ldr(s::Sample; solver = HiGHS.Optimizer)
+function primal_ldr(s::Sample; solver = HiGHS.Optimizer)
     ldr = Model(solver)
     set_silent(ldr)
 
@@ -371,142 +371,89 @@ dual_ldr_row(probs, Φ, row) = Φ' * (probs .* row)
 dual_ldr_row(s::Sample, row) = dual_ldr_row(s.probs, s.Φ, row)
 
 """
-    basis_function_dual_ldr(s; solver = HiGHS.Optimizer)
+    dual_ldr(s; slacks = :all, solver = HiGHS.Optimizer)
 
 Monolithic scenario expansion of the dual linear decision rule over the sample
-`s` (`Dual_scenarios.tex`, "Scenario expansion"). Where `basis_function_ldr`
-restricts the *primal* decisions to a rule and keeps every dispatch constraint
-exact, scenario by scenario, this restricts the *dual* multiplier instead,
+`s` (`Dual_scenarios.tex`, "Scenario expansion"). Where `primal_ldr` restricts
+the *primal* decisions to a rule and keeps every dispatch constraint exact,
+scenario by scenario, this restricts the *dual* multiplier instead,
 `z(ξ) = Z·L(ξ)`, and leaves the primal scenario variables `x(ξ_k)`, `s(ξ_k)`
 free. Eliminating `Z` -- the sup over it is `0` where the multiplier's
 coefficient vanishes, `+∞` otherwise -- turns every row of the canonical form
 `A x(ξ) + s(ξ) = b(ξ), s(ξ) ≥ 0` from a pointwise constraint into its
 basis-weighted average over the sample being zero:
 `(1/K) Σ_k (A x(ξ_k) + s(ξ_k) - b(ξ_k)) L(ξ_k)^T = 0`. By weak duality this is
-a *lower* bound on the value of `basis_function_ldr`'s sampled model -- dual to
-that upper bound -- and it can be loose, or even unbounded below, for a basis
-that is too poor, since nothing here forces `x(ξ_k)` itself to be
-non-anticipative.
+a *lower* bound on the value of `primal_ldr`'s sampled model -- dual to that
+upper bound -- and it can be loose, or even unbounded below, for a basis that
+is too poor, since nothing here forces `x(ξ_k)` itself to be non-anticipative.
 
-The canonical form is built explicitly: `volume`, `hydro`, `spill`, `termos`
-and `θ` are free, and every one of their original bounds -- along with the
-future-cost cuts -- becomes an equality against a slack `≥ 0`; the water
-balance and the demand balance, already equalities, get none. Accepts the same
-arguments as `basis_function_ldr`.
+`slacks` picks how much of the canonical form is built explicitly:
+
+  * `:all` turns every bound of `primal_ldr` -- `0<=volume<=capacity`,
+    `0<=hydro<=generation`, `spill>=0`, `0<=termos<=termo_generations[i]`,
+    `θ>=0`, plus the future-cost cuts -- into an equality against its own
+    slack `>= 0`, with `volume`, `hydro`, `spill`, `termos` and `θ` left free.
+    The water balance and the demand balance, already equalities, get none;
+  * `:coupling` keeps every one of those bounds on `volume`, `hydro`, `spill`,
+    `termos` and `θ` exactly as in `primal_ldr` -- pointwise, not relaxed --
+    and only relaxes the rows that genuinely couple different components:
+    water balance, demand balance, and the future-cost cuts (the one bound
+    that mixes `θ` and `volume`, so it keeps its own slack `cuts_slack`). A
+    canonical-form row only needs a slack -- hence a dual multiplier for
+    `dual_ldr_row` to relax -- when it carries information beyond a bound
+    already on `x` itself: every bound above has exactly this shape, its
+    "slack" tied to `x` by a trivial identity rather than a genuine coupling,
+    so relaxing it throws away information for nothing -- substituting the
+    identity back in changes nothing about what `x` is allowed to be, it only
+    lets `x` and its own bound-slack disagree scenario by scenario, which
+    HiGHS is only too willing to exploit at the cost of the bound (`:all` got
+    stuck at the deterministic mean-scenario value on this toy problem).
+
+Every row `:coupling` enforces is also enforced, in one of the two forms, by
+`:all`, so solving the `:all` model gives a lower bound at least as tight; see
+`dual_ldr_moments` for reading `E[x(ξ)L(ξ)^T]` off a `:coupling` solution.
 """
-function basis_function_dual_ldr(s::Sample; solver = HiGHS.Optimizer)
+function dual_ldr(s::Sample; slacks = :all, solver = HiGHS.Optimizer)
+    slacks in (:all, :coupling) ||
+        throw(ArgumentError("slacks must be :all or :coupling"))
     ldr = Model(solver)
     set_silent(ldr)
 
     (; problem, T, inflow, probs, Φ) = s
     n_scen = scenario_count(s)
 
-    # Primal scenario variables x(ξ_k): free, their bounds become slack rows below
-    @variables(ldr, begin
-        volume[1:T,1:n_scen]
-        hydro[1:T,1:n_scen]
-        spill[1:T,1:n_scen]
-        termos[1:problem.termo_count,1:T,1:n_scen]
-        θ[1:n_scen]
-    end)
-
-    # Slacks s(ξ_k) >= 0, one per bound / inequality of basis_function_ldr
-    @variables(ldr, begin
-        volume_hi[1:T,1:n_scen] >= 0
-        volume_lo[1:T,1:n_scen] >= 0
-        hydro_hi[1:T,1:n_scen] >= 0
-        hydro_lo[1:T,1:n_scen] >= 0
-        spill_lo[1:T,1:n_scen] >= 0
-        termos_hi[1:problem.termo_count,1:T,1:n_scen] >= 0
-        termos_lo[1:problem.termo_count,1:T,1:n_scen] >= 0
-        θ_lo[1:n_scen] >= 0
-        cuts_slack[1:problem.cuts_count,1:n_scen] >= 0
-    end)
-
-    @objective(ldr, Min,
-        sum(problem.termo_costs[i] * termos[i,t,k] * probs[k]
-            for i in 1:problem.termo_count, t in 1:T, k in 1:n_scen) +
-        sum(θ[k] * probs[k] for k in 1:n_scen))
-
-    # Water balance and demand balance: already equalities, no slack
-    for t in 1:T
-        previous = t == 1 ? fill(problem.initial_volume, n_scen) : volume[t-1,:]
-        @constraint(ldr, dual_ldr_row(probs, Φ,
-            volume[t,:] .- previous .- inflow[t,:] .+ hydro[t,:] .+ spill[t,:]) .== 0)
-        @constraint(ldr, dual_ldr_row(probs, Φ,
-            hydro[t,:] .+ sum(termos[i,t,:] for i in 1:problem.termo_count) .-
-            problem.stage_demands[t]) .== 0)
+    if slacks === :all
+        # Primal scenario variables x(ξ_k): free, their bounds become slack rows below
+        @variables(ldr, begin
+            volume[1:T,1:n_scen]
+            hydro[1:T,1:n_scen]
+            spill[1:T,1:n_scen]
+            termos[1:problem.termo_count,1:T,1:n_scen]
+            θ[1:n_scen]
+        end)
+        # Slacks s(ξ_k) >= 0, one per bound / inequality of primal_ldr
+        @variables(ldr, begin
+            volume_hi[1:T,1:n_scen] >= 0
+            volume_lo[1:T,1:n_scen] >= 0
+            hydro_hi[1:T,1:n_scen] >= 0
+            hydro_lo[1:T,1:n_scen] >= 0
+            spill_lo[1:T,1:n_scen] >= 0
+            termos_hi[1:problem.termo_count,1:T,1:n_scen] >= 0
+            termos_lo[1:problem.termo_count,1:T,1:n_scen] >= 0
+            θ_lo[1:n_scen] >= 0
+        end)
+    else
+        # Primal scenario variables x(ξ_k), bounded exactly as in primal_ldr:
+        # no slack for a bound that x already carries directly.
+        @variables(ldr, begin
+            0 <= volume[1:T,1:n_scen] <= problem.hydro_capacity
+            0 <= hydro[1:T,1:n_scen] <= problem.hydro_generation
+            0 <= spill[1:T,1:n_scen]
+            0 <= termos[i=1:problem.termo_count,1:T,1:n_scen] <= problem.termo_generations[i]
+            θ[1:n_scen] >= 0
+        end)
     end
-
-    # Bounds, turned into slack rows
-    for t in 1:T
-        @constraint(ldr, dual_ldr_row(probs, Φ, volume[t,:] .+ volume_hi[t,:] .- problem.hydro_capacity) .== 0)
-        @constraint(ldr, dual_ldr_row(probs, Φ, volume_lo[t,:] .- volume[t,:]) .== 0)
-        @constraint(ldr, dual_ldr_row(probs, Φ, hydro[t,:] .+ hydro_hi[t,:] .- problem.hydro_generation) .== 0)
-        @constraint(ldr, dual_ldr_row(probs, Φ, hydro_lo[t,:] .- hydro[t,:]) .== 0)
-        @constraint(ldr, dual_ldr_row(probs, Φ, spill_lo[t,:] .- spill[t,:]) .== 0)
-        for i in 1:problem.termo_count
-            @constraint(ldr, dual_ldr_row(probs, Φ,
-                termos[i,t,:] .+ termos_hi[i,t,:] .- problem.termo_generations[i]) .== 0)
-            @constraint(ldr, dual_ldr_row(probs, Φ, termos_lo[i,t,:] .- termos[i,t,:]) .== 0)
-        end
-    end
-    @constraint(ldr, dual_ldr_row(probs, Φ, θ_lo .- θ) .== 0)
-    for i in 1:problem.cuts_count
-        @constraint(ldr, dual_ldr_row(probs, Φ,
-            cuts_slack[i,:] .+ problem.cuts_coeff[i] .* volume[T,:] .- θ .+ problem.cuts_inter[i]) .== 0)
-    end
-
-    return ldr
-end
-
-"""
-    basis_function_dual_ldr_compact(s; solver = HiGHS.Optimizer)
-
-A leaner scenario expansion of the dual LDR than `basis_function_dual_ldr`: a
-canonical-form row only needs a slack -- hence a dual multiplier for
-`dual_ldr_row` to relax -- when it carries information beyond a bound already
-on `x` itself. Every bound of `basis_function_ldr` (`0<=volume<=capacity`,
-`0<=hydro<=generation`, `spill>=0`, `0<=termos<=termo_generations[i]`,
-`θ>=0`) has exactly this shape: its "slack" is just `x` (the lower bound) or
-`bound - x` (the upper one), tied to `x` by a trivial identity rather than a
-genuine coupling. Relaxing *that* identity's multiplier to a basis-restricted
-rule throws away information for nothing, since substituting the identity back
-in changes nothing about what `x` is allowed to be -- it only lets `x` and its
-own bound-slack disagree scenario by scenario, which the model in
-`basis_function_dual_ldr`'s docstring found HiGHS is only too willing to
-exploit, at the cost of the bound (see there for how it got stuck at the
-deterministic mean-scenario value).
-
-So here `volume`, `hydro`, `spill`, `termos` and `θ` keep their ORIGINAL,
-pointwise bounds -- exactly as in `basis_function_ldr` -- and only the rows
-that genuinely couple different components -- water balance, demand balance,
-and the future-cost cuts (the one bound that mixes `θ` and `volume`, so it
-keeps its own slack `cuts_slack`) -- are relaxed to their basis-weighted
-average, following the same derivation as `basis_function_dual_ldr`.
-
-Accepts the same arguments as `basis_function_ldr`. Every row this model
-enforces is also enforced (in one of the two forms) by `basis_function_dual_ldr`,
-so solving it gives a lower bound at least as tight; see
-`dual_ldr_compact_moments` for reading `E[x(ξ)L(ξ)^T]` off the solution.
-"""
-function basis_function_dual_ldr_compact(s::Sample; solver = HiGHS.Optimizer)
-    ldr = Model(solver)
-    set_silent(ldr)
-
-    (; problem, T, inflow, probs, Φ) = s
-    n_scen = scenario_count(s)
-
-    # Primal scenario variables x(ξ_k), bounded exactly as in basis_function_ldr:
-    # no slack for a bound that x already carries directly.
-    @variables(ldr, begin
-        0 <= volume[1:T,1:n_scen] <= problem.hydro_capacity
-        0 <= hydro[1:T,1:n_scen] <= problem.hydro_generation
-        0 <= spill[1:T,1:n_scen]
-        0 <= termos[i=1:problem.termo_count,1:T,1:n_scen] <= problem.termo_generations[i]
-        θ[1:n_scen] >= 0
-    end)
-    # The one genuine coupling inequality still needs its own slack s(ξ_k) >= 0
+    # The one genuine coupling inequality always needs its own slack s(ξ_k) >= 0
     @variable(ldr, cuts_slack[1:problem.cuts_count,1:n_scen] >= 0)
 
     @objective(ldr, Min,
@@ -523,7 +470,23 @@ function basis_function_dual_ldr_compact(s::Sample; solver = HiGHS.Optimizer)
             hydro[t,:] .+ sum(termos[i,t,:] for i in 1:problem.termo_count) .-
             problem.stage_demands[t]) .== 0)
     end
-    # The future-cost cuts, the one bound genuinely coupling θ and volume
+
+    if slacks === :all
+        # Bounds, turned into slack rows
+        for t in 1:T
+            @constraint(ldr, dual_ldr_row(probs, Φ, volume[t,:] .+ volume_hi[t,:] .- problem.hydro_capacity) .== 0)
+            @constraint(ldr, dual_ldr_row(probs, Φ, volume_lo[t,:] .- volume[t,:]) .== 0)
+            @constraint(ldr, dual_ldr_row(probs, Φ, hydro[t,:] .+ hydro_hi[t,:] .- problem.hydro_generation) .== 0)
+            @constraint(ldr, dual_ldr_row(probs, Φ, hydro_lo[t,:] .- hydro[t,:]) .== 0)
+            @constraint(ldr, dual_ldr_row(probs, Φ, spill_lo[t,:] .- spill[t,:]) .== 0)
+            for i in 1:problem.termo_count
+                @constraint(ldr, dual_ldr_row(probs, Φ,
+                    termos[i,t,:] .+ termos_hi[i,t,:] .- problem.termo_generations[i]) .== 0)
+                @constraint(ldr, dual_ldr_row(probs, Φ, termos_lo[i,t,:] .- termos[i,t,:]) .== 0)
+            end
+        end
+        @constraint(ldr, dual_ldr_row(probs, Φ, θ_lo .- θ) .== 0)
+    end
     for i in 1:problem.cuts_count
         @constraint(ldr, dual_ldr_row(probs, Φ,
             cuts_slack[i,:] .+ problem.cuts_coeff[i] .* volume[T,:] .- θ .+ problem.cuts_inter[i]) .== 0)
@@ -533,19 +496,18 @@ function basis_function_dual_ldr_compact(s::Sample; solver = HiGHS.Optimizer)
 end
 
 """
-    dual_ldr_compact_moments(model, s)
+    dual_ldr_moments(model, s)
 
-`M_x = E[x(ξ)L(ξ)^T]` of a `basis_function_dual_ldr_compact` model built on
-the sample `s` and solved: the basis-weighted average of every scenario's
+`M_x = E[x(ξ)L(ξ)^T]` of a `dual_ldr(s; slacks = :coupling)` model built on the
+sample `s` and solved: the basis-weighted average of every scenario's
 `volume`, `hydro`, `spill`, `termos` and `θ`, one `... x basis_count(s)` matrix
-per decision. Unlike
-`basis_function_ldr`'s rule, `x(ξ_k)` here is never forced to equal this
-combination -- individual scenarios are free to deviate from it, which is the
-source of the model's extra slack (see `basis_function_dual_ldr`'s docstring)
--- so `M_x` is only the closest rule-shaped *summary* of the solution, not a
-policy the model guarantees is itself feasible.
+per decision. Unlike `primal_ldr`'s rule, `x(ξ_k)` here is never forced to
+equal this combination -- individual scenarios are free to deviate from it,
+which is the source of the model's extra slack under `slacks = :all` (see
+`dual_ldr`'s docstring) -- so `M_x` is only the closest rule-shaped *summary*
+of the solution, not a policy the model guarantees is itself feasible.
 """
-function dual_ldr_compact_moments(model, s::Sample)
+function dual_ldr_moments(model, s::Sample)
     moment(row) = dual_ldr_row(s, row)
     volume, hydro, spill, termos, θ = model[:volume], model[:hydro], model[:spill], model[:termos], model[:θ]
     T = size(volume, 1)
@@ -565,7 +527,7 @@ end
 # ---------------------------------------------------------------------------
 # Two-stage (Benders) decomposition of the basis-function LDR model
 #
-# `basis_function_ldr` builds one copy of the dispatch problem per scenario and
+# `primal_ldr` builds one copy of the dispatch problem per scenario and
 # ties every copy to the same decision-rule coefficients.  Those coefficients
 # are the only variables shared by the scenarios, so they are a natural first
 # stage:
@@ -574,7 +536,7 @@ end
 #
 # where Q_k(x) is the cost of scenario k under the rule x, and Q_k(x) = +∞ when
 # the rule is infeasible in that scenario.  Each Q_k is evaluated by a small LP
-# (`basis_ldr_subproblem`) holding scenario k's dispatch constraints, coupled to
+# (`primal_ldr_subproblem`) holding scenario k's dispatch constraints, coupled to
 # a fixed copy of x.  Solving it in two passes gives the two kinds of cut:
 #
 #   * feasibility pass: minimize the L1 distance from the policy the rule
@@ -596,7 +558,7 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    basis_ldr_subproblem(s, k; solver = HiGHS.Optimizer)
+    primal_ldr_subproblem(s, k; solver = HiGHS.Optimizer)
 
 The subproblem of scenario `k` of the sample `s`: its dispatch constraints, a
 fixed copy of the decision-rule coefficients, and the slacks measuring the
@@ -604,7 +566,7 @@ violation of the coupling `decision == Σ_j coefficient_j * Φ[k,j]`.
 
 `feasibility_mode!` and `optimality_mode!` switch the model between the two passes.
 """
-function basis_ldr_subproblem(s::Sample, k; solver = HiGHS.Optimizer)
+function primal_ldr_subproblem(s::Sample, k; solver = HiGHS.Optimizer)
     sub = Model(solver)
     set_silent(sub)
     (; problem, T) = s
@@ -703,12 +665,12 @@ function subproblem_cut(value, sub, x, x̄)
 end
 
 """
-    basis_function_ldr_benders(s; kwargs...)
+    primal_ldr_benders(s; kwargs...)
 
-Solve the model of `basis_function_ldr` by Benders decomposition: the
+Solve the model of `primal_ldr` by Benders decomposition: the
 decision-rule coefficients stay in a master problem and each scenario is solved
 separately, contributing a feasibility or an optimality cut (see the comment
-above).  Accepts the same `solver` as `basis_function_ldr`, plus
+above).  Accepts the same `solver` as `primal_ldr`, plus
 
   * `max_iterations`, `tol`: stop when the gap between the master bound and the
     best rule found is within `tol` (relative), or after so many iterations;
@@ -725,7 +687,7 @@ inspection: whether the loop `converged`, its iteration count, the number of
 cuts of each kind, the fitted `coefficients`, and the `master` and `subproblems`
 models.  A rule found infeasible has `Obj = Inf` and `NaN` coefficients.
 """
-function basis_function_ldr_benders(
+function primal_ldr_benders(
     s::Sample;
     solver = HiGHS.Optimizer,
     max_iterations = 500,
@@ -746,7 +708,7 @@ function basis_function_ldr_benders(
     @objective(master, Min, sum(probs[k] * α[k] for k in 1:n_scen))
 
     # Second stage: one subproblem per scenario, built once and re-solved
-    subs = [basis_ldr_subproblem(s, k; solver) for k in 1:n_scen]
+    subs = [primal_ldr_subproblem(s, k; solver) for k in 1:n_scen]
 
     lower, upper = -Inf, Inf
     best, converged = nothing, false
@@ -846,13 +808,13 @@ end
 # ---------------------------------------------------------------------------
 # Two-stage (Benders) decomposition of the dual-LDR model
 #
-# `basis_function_dual_ldr` keeps every scenario's primal variables x(ξ_k),
-# s(ξ_k) and enforces the moment matrices
+# `dual_ldr` keeps every scenario's primal variables x(ξ_k), s(ξ_k) and
+# enforces the moment matrices
 #
 #   M_x = (1/K) Σ_k x(ξ_k) L(ξ_k)^T,   M_s = (1/K) Σ_k s(ξ_k) L(ξ_k)^T
 #
 # only implicitly, through the aggregate row `A x(ξ_k) + s(ξ_k) - b(ξ_k)`
-# weighted by every basis function.  Making M_x and M_s themselves the first
+# weighted by every basis function.  Making the moments themselves the first
 # stage (`Dual_scenarios.tex`, eq. 103-112) turns that around: the balance
 # `A M_x + M_s = (1/K) Σ_k b(ξ_k) L(ξ_k)^T` becomes a first-stage constraint on
 # the moments directly, and two further things fall out of the structure of
@@ -863,28 +825,54 @@ end
 #     function L₁(ξ) ≡ 1 makes it exactly the mean of x(ξ_k) (`basis_values`).
 #     The objective is therefore a fixed linear function of the first-stage
 #     variables, and the master needs no epigraph and no optimality cuts;
-#   * M_x needs no feasibility subproblem either: with the basis matrix Φ of
-#     full column rank on its positive-probability scenarios (checked below,
-#     `active_rank`), M_x = X diag(probs) Φ can realize any target matrix from
-#     some free X, because right-multiplication by diag(probs) Φ is then
-#     surjective. A rank-deficient Φ would need the extra null-space rows
-#     Dual_scenarios.tex describes for M_x (not implemented here).
+#   * water balance, demand balance and the future-cost cuts are pure
+#     algebraic relations *between* moments, so they stay exact linear
+#     constraints on the master, no subproblem needed, in either mode.
 #
-# M_s is the one moment that needs a subproblem: not every matrix is the
-# moment of *nonnegative* s(ξ_k) (`rows of M_s ∈ cone L(ξ)`), and unlike M_x,
-# checking membership of that cone is exactly what `dual_ldr_ms_subproblem`
-# does, covering every scenario and every slack of `basis_function_dual_ldr`
-# at once, since none of them are otherwise coupled once M_x is set aside.
+# `slacks` -- the same keyword as `dual_ldr`'s -- then picks what else a
+# scenario's feasibility subproblem has to check:
+#
+#   * `:all` leaves `volume`, `hydro`, `spill`, `termos` and `θ` free, so M_x
+#     needs no subproblem either: with the basis matrix Φ of full column rank
+#     on its positive-probability scenarios (checked below, `active_rank`),
+#     M_x = X diag(probs) Φ can realize any target matrix from some free X,
+#     because right-multiplication by diag(probs) Φ is then surjective (a
+#     rank-deficient Φ would need the extra null-space rows Dual_scenarios.tex
+#     describes for M_x, not implemented here). M_s is then the one moment
+#     that needs a subproblem: not every matrix is the moment of *nonnegative*
+#     s(ξ_k) (`rows of M_s ∈ cone L(ξ)`), and checking membership of that cone
+#     is exactly what `dual_ldr_ms_subproblem` does, covering every scenario
+#     and every slack at once, since none of them are otherwise coupled once
+#     M_x is set aside;
+#   * `:coupling` keeps `volume`, `hydro`, `spill`, `termos` and `θ` bounded
+#     exactly as in `primal_ldr`, so M_x's own rows are *not* trivially
+#     achievable any more -- `volume`, say, is bounded pointwise, so its
+#     moment is restricted to the (nontrivial) polytope of moments of bounded
+#     sequences, not all of R^K.  Checking that membership is
+#     `dual_ldr_coupling_subproblem`'s job, one family at a time (they never
+#     interact with each other inside it, only through the master's own
+#     equations) -- and it covers `cuts_slack`'s cone-membership too, the same
+#     check `dual_ldr_ms_subproblem` makes, since that is still a genuine
+#     slack.  Because every basis here is nonnegative-valued, the same trick
+#     as `add_ms_moments!` gives cheap, necessary bounds on every M_x row
+#     directly -- and here they cut both ways (`0 <= M_x <= bound * φ̄`) for
+#     the once-bounded decisions, so the master's objective (a sum of two such
+#     bounded terms) can never be unbounded below, unlike `:all`'s master
+#     before any cut has narrowed it down.
+#
 # `feasibility_mode!` and `subproblem_cut`, already defined above for the
-# primal decomposition, apply unchanged: the subproblem's gaps and fixed
-# parameters are laid out the same way, just for M_s's coupling instead of the
-# LDR coefficients'.
+# primal decomposition, apply unchanged in both subproblems: their gaps and
+# fixed parameters are laid out the same way, just for the moment coupling
+# instead of the LDR coefficients'.  And once built, the two masters share the
+# very same Benders loop (`dual_ldr_benders_loop!`): both report a bound that
+# is already valid at every iteration, so neither needs an epigraph, only a
+# feasibility cut when the subproblem finds a violation.
 # ---------------------------------------------------------------------------
 
 """
     add_ms_moments!(model, s)
 
-Declare the second-moment matrix `M_s` of `basis_function_dual_ldr` -- one
+Declare the second-moment matrix `M_s` of `dual_ldr(s; slacks = :all)` -- one
 `... x K` matrix per slack, laid out exactly like that model's slacks -- and
 return them flattened, in the order every other function of this decomposition
 uses.
@@ -930,15 +918,16 @@ ms_moments(model) = [
 """
     dual_ldr_ms_subproblem(s; solver = HiGHS.Optimizer)
 
-The feasibility subproblem of the dual-LDR decomposition: every scenario's
-slacks `s(ξ_k)`, and the gaps measuring how far the basis-weighted moment of
-each one is from a fixed copy of the master's `M_s`. It needs neither `x(ξ_k)`
-nor the inflow -- every slack's defining row (a bound or a future-cost cut of
-`basis_function_dual_ldr`) is already accounted for at the moment level by the
-master's `A M_x + M_s = ...` balance, so all that is left to check here is
-whether `M_s` is the moment of *some* nonnegative choice of `s(ξ_k)`.
+The feasibility subproblem of `dual_ldr_benders(s; slacks = :all)`: every
+scenario's slacks `s(ξ_k)`, and the gaps measuring how far the basis-weighted
+moment of each one is from a fixed copy of the master's `M_s`. It needs
+neither `x(ξ_k)` nor the inflow -- every slack's defining row (a bound or a
+future-cost cut of `dual_ldr(s; slacks = :all)`) is already accounted for at
+the moment level by the master's `A M_x + M_s = ...` balance, so all that is
+left to check here is whether `M_s` is the moment of *some* nonnegative choice
+of `s(ξ_k)`.
 
-`feasibility_mode!` (shared with `basis_ldr_subproblem`) is the only mode this
+`feasibility_mode!` (shared with `primal_ldr_subproblem`) is the only mode this
 needs: its optimum is the L1 distance from the master's `M_s` to the set of
 achievable moments, `0` meaning some nonnegative `s(ξ_k)` realizes it exactly.
 """
@@ -1016,201 +1005,14 @@ function dual_ldr_ms_subproblem(s::Sample; solver = HiGHS.Optimizer)
 end
 
 """
-    basis_function_dual_ldr_benders(s; kwargs...)
+    add_coupling_moments!(model, s)
 
-Solve the model of `basis_function_dual_ldr` by Benders decomposition: the
-moment matrices `M_x` and `M_s` stay in a master problem, and a single
-feasibility subproblem (`dual_ldr_ms_subproblem`) checks whether the master's
-`M_s` is achievable by nonnegative scenario slacks, contributing a feasibility
-cut when it is not (see the comment above). Accepts the same `solver` as
-`basis_function_ldr`, plus
-
-  * `max_iterations`, `feasibility_tol`: stop when the subproblem's violation
-    is within tolerance, or after so many iterations;
-  * `verbose`: print the bound and the violation of every iteration.
-
-Unlike the primal decomposition, this one never produces a rule -- `M_x` is a
-*moment*, not a decision, so there is no first-stage policy to report -- and
-its master's objective at every iteration is already a valid lower bound on
-`basis_function_dual_ldr`'s value, exact as soon as the subproblem reports no
-violation. Returns `(; Obj, dt)`, matching the lower bound to the other
-methods' `Obj` field, plus whether the loop `converged`, its `iterations`, the
-number of feasibility `cuts`, and the `master` and `subproblem` models.
-
-Before enough cuts pin down `M_s`, the master is only the balance equation on
-an otherwise free `M_s` and is typically unbounded (`DUAL_INFEASIBLE`) rather
-than merely loose -- unlike the monolithic model, where every scenario's own
-slacks are individually sign-restricted. Since the achievable-`M_s` cone is
-positively homogeneous, the unbounded ray HiGHS reports in that case is itself
-a valid point to feed the subproblem, and a positive violation there yields a
-homogeneous cut that removes the whole ray, not just one point on it; a zero
-violation instead means the ray is genuine, and the dual LDR really is
-unbounded below for this basis (see `basis_function_dual_ldr`'s docstring).
-"""
-function basis_function_dual_ldr_benders(
-    s::Sample;
-    solver = HiGHS.Optimizer,
-    max_iterations = 500,
-    feasibility_tol = 1e-6,
-    verbose = false,
-)
-    (; problem, T, inflow, probs, Φ, φ̄) = s
-    K = basis_count(s)
-    r = active_rank(Φ, probs)
-    r == K || @warn "the basis matrix Φ is rank-deficient on the positive-probability " *
-        "scenarios ($r < $K): M_x is then under-determined by the balance constraints " *
-        "alone, and would need the extra null-space rows Dual_scenarios.tex describes " *
-        "(not implemented here)."
-
-    # First stage: the moment matrices. Any M_x is achievable by some free
-    # x(ξ_k) (see the comment above), so it needs no subproblem; M_s does, and
-    # is the only coupling the subproblem below is given.
-    master = Model(solver)
-    set_silent(master)
-    @variables(master, begin
-        volume_mx[1:T,1:K]
-        hydro_mx[1:T,1:K]
-        spill_mx[1:T,1:K]
-        termos_mx[1:problem.termo_count,1:T,1:K]
-        θ_mx[1:K]
-    end)
-    Ms = add_ms_moments!(master, s)
-    volume_hi_ms, volume_lo_ms, hydro_hi_ms, hydro_lo_ms, spill_lo_ms, termos_hi_ms, termos_lo_ms, θ_lo_ms, cuts_ms =
-        master[:volume_hi_ms], master[:volume_lo_ms], master[:hydro_hi_ms], master[:hydro_lo_ms],
-        master[:spill_lo_ms], master[:termos_hi_ms], master[:termos_lo_ms], master[:θ_lo_ms], master[:cuts_ms]
-
-    for t in 1:T
-        previous = t == 1 ? problem.initial_volume .* φ̄ : volume_mx[t-1,:]
-        @constraint(master, volume_mx[t,:] .- previous .- dual_ldr_row(probs, Φ, inflow[t,:]) .+
-            hydro_mx[t,:] .+ spill_mx[t,:] .== 0)
-        @constraint(master, hydro_mx[t,:] .+ sum(termos_mx[i,t,:] for i in 1:problem.termo_count) .-
-            problem.stage_demands[t] .* φ̄ .== 0)
-        @constraint(master, volume_mx[t,:] .+ volume_hi_ms[t,:] .- problem.hydro_capacity .* φ̄ .== 0)
-        @constraint(master, volume_lo_ms[t,:] .- volume_mx[t,:] .== 0)
-        @constraint(master, hydro_mx[t,:] .+ hydro_hi_ms[t,:] .- problem.hydro_generation .* φ̄ .== 0)
-        @constraint(master, hydro_lo_ms[t,:] .- hydro_mx[t,:] .== 0)
-        @constraint(master, spill_lo_ms[t,:] .- spill_mx[t,:] .== 0)
-        for i in 1:problem.termo_count
-            @constraint(master, termos_mx[i,t,:] .+ termos_hi_ms[i,t,:] .-
-                problem.termo_generations[i] .* φ̄ .== 0)
-            @constraint(master, termos_lo_ms[i,t,:] .- termos_mx[i,t,:] .== 0)
-        end
-    end
-    @constraint(master, θ_lo_ms .- θ_mx .== 0)
-    for i in 1:problem.cuts_count
-        @constraint(master, cuts_ms[i,:] .+ problem.cuts_coeff[i] .* volume_mx[T,:] .- θ_mx .+
-            problem.cuts_inter[i] .* φ̄ .== 0)
-    end
-    # Costs do not depend on the scenario, so the objective only needs the
-    # mean of x(ξ_k) -- the first column of M_x, since L₁(ξ) ≡ 1 (see the
-    # comment above and `basis_values`).
-    @objective(master, Min,
-        sum(problem.termo_costs[i] * termos_mx[i,t,1] for i in 1:problem.termo_count, t in 1:T) +
-        θ_mx[1])
-
-    # Second stage: one feasibility subproblem, covering every scenario
-    sub = dual_ldr_ms_subproblem(s; solver)
-
-    lower = -Inf
-    converged, iterations, cuts, dt = false, 0, 0, 0.0
-    for iteration in 1:max_iterations
-        iterations = iteration
-        dt += @elapsed optimize!(master)
-        status = termination_status(master)
-        if status == INFEASIBLE
-            # Feasibility cuts have exhausted every M_s: the basis cannot
-            # represent a feasible dual multiplier at all.
-            verbose && println("master problem is INFEASIBLE")
-            lower, converged = Inf, true
-            break
-        elseif status ∉ (OPTIMAL, DUAL_INFEASIBLE)
-            verbose && println("master problem is $status")
-            break
-        end
-        # Before enough cuts restrict M_s, the master is only the balance
-        # equation on a totally free M_s and is typically unbounded: HiGHS then
-        # reports an unbounded *ray* instead of an optimum. Since the cone of
-        # achievable M_s is positively homogeneous, checking that ray against
-        # the very same subproblem is meaningful, and `subproblem_cut` turns a
-        # positive violation into a homogeneous cut that rules out the whole
-        # ray, not just this one point.
-        M̄s = value.(Ms)
-
-        fix.(sub.ext[:params], M̄s; force = true)
-        feasibility_mode!(sub)
-        dt += @elapsed optimize!(sub)
-        termination_status(sub) == OPTIMAL ||
-            error("feasibility subproblem is $(termination_status(sub))")
-        violation = objective_value(sub)
-
-        if status == OPTIMAL
-            lower = objective_value(master)
-        end
-        verbose && println("iteration $iteration: " *
-            (status == OPTIMAL ? "bound $(round(lower; digits=2))" : "master unbounded") *
-            ", violation $(round(violation; digits=6)), $cuts cuts so far")
-        if violation <= feasibility_tol
-            converged = true
-            if status == DUAL_INFEASIBLE
-                # A feasible ray: this basis leaves the dual LDR genuinely
-                # unbounded below (see `basis_function_dual_ldr`'s docstring),
-                # not merely under-cut.
-                lower = -Inf
-            end
-            break
-        end
-        @constraint(master, 0 >= subproblem_cut(violation, sub, Ms, M̄s))
-        cuts += 1
-    end
-
-    return (;
-        Obj = lower,
-        dt,
-        converged,
-        iterations,
-        cuts,
-        master,
-        subproblem = sub,
-    )
-end
-
-# ---------------------------------------------------------------------------
-# Two-stage (Benders) decomposition of the compact dual-LDR model
-#
-# `basis_function_dual_ldr_compact` drops the slack (and its relaxed
-# multiplier) that `basis_function_dual_ldr` used to add for every bound `x`
-# already carries as its own sign restriction, keeping `volume`, `hydro`,
-# `spill`, `termos` and `θ` bounded exactly as in `basis_function_ldr`. That
-# changes what a decomposition of it needs to check:
-#
-#   * water balance, demand balance and the future-cost cuts are still pure
-#     algebraic relations *between* moments (`A M_x + M_s = ...`), so they stay
-#     exact linear constraints on the master's moments, no subproblem needed;
-#   * but now `M_x`'s own rows are *not* trivially achievable the way they
-#     were when `x` was free -- `volume`, say, is bounded pointwise, so its
-#     moment is restricted to the (nontrivial) polytope of moments of
-#     bounded sequences, not all of R^K. Checking that membership is the
-#     subproblem's job here, one family at a time (they never interact with
-#     each other inside it, only through the master's own equations) -- and it
-#     covers `cuts_slack`'s cone-membership too, the same check
-#     `dual_ldr_ms_subproblem` made, since that is still a genuine slack.
-#
-# Because every basis here is nonnegative-valued, the same trick as
-# `add_ms_moments!` gives cheap, necessary bounds on every M_x row directly --
-# and here they cut both ways (`0 <= M_x <= bound * φ̄`) for the once-bounded
-# decisions, so the master's objective (a sum of two such bounded terms) can
-# never be unbounded below, unlike the full-slack decomposition's master.
-# ---------------------------------------------------------------------------
-
-"""
-    add_compact_moments!(model, s)
-
-Declare the moment matrices of `basis_function_dual_ldr_compact`'s primal
+Declare the moment matrices of `dual_ldr(s; slacks = :coupling)`'s primal
 scenario variables -- `volume`, `hydro`, `spill`, `termos`, `θ`, and the one
 genuine slack `cuts_slack` -- each `... x K`, and return them as a named
 tuple.
 """
-function add_compact_moments!(model, s::Sample)
+function add_coupling_moments!(model, s::Sample)
     (; problem, T) = s
     K = basis_count(s)
     @variables(model, begin
@@ -1227,12 +1029,12 @@ function add_compact_moments!(model, s::Sample)
     )
 end
 
-"The moments of `add_compact_moments!` as a flat vector, in the order the feasibility subproblem below matches them."
-compact_moments_flat(mts) =
+"The moments of `add_coupling_moments!` as a flat vector, in the order the feasibility subproblem below matches them."
+coupling_moments_flat(mts) =
     [vec(mts.volume_mx); vec(mts.hydro_mx); vec(mts.spill_mx); vec(mts.termos_mx); vec(mts.θ_mx); vec(mts.cuts_mx)]
 
 """
-    add_compact_moment_bounds!(model, mts, s)
+    add_coupling_moment_bounds!(model, mts, s)
 
 The cheap, necessary bounds every row of `mts` obeys because every basis
 function in this file is nonnegative-valued: the moment of a variable that is
@@ -1240,14 +1042,14 @@ pointwise within `[lo,hi]` is itself within `[lo,hi] * φ̄` entrywise (a
 nonnegative combination of numbers in `[lo,hi]`, weighted by the nonnegative
 `Φ[k,:]`, stays in `[lo,hi] * (weights' sum)`). `volume`, `hydro` and `termos`
 get both bounds this way; `spill`, `θ` and `cuts_mx` only the lower one, since
-those are unbounded above already in `basis_function_dual_ldr_compact`.
+those are unbounded above already in `dual_ldr(s; slacks = :coupling)`.
 
 Declared directly rather than left to the feasibility subproblem, these are
 what let the master's objective (`Σ cost·termos_mx[:,:,1] + θ_mx[1]`, both
-terms now bounded below) never be unbounded, unlike the full-slack
-decomposition's master before any cut narrowed it down.
+terms now bounded below) never be unbounded, unlike `:all`'s master before any
+cut narrowed it down.
 """
-function add_compact_moment_bounds!(model, mts, s::Sample)
+function add_coupling_moment_bounds!(model, mts, s::Sample)
     (; problem, φ̄) = s
     @constraint(model, mts.volume_mx .>= 0)
     @constraint(model, mts.volume_mx .<= problem.hydro_capacity .* φ̄')
@@ -1264,32 +1066,32 @@ function add_compact_moment_bounds!(model, mts, s::Sample)
 end
 
 """
-    compact_moments_subproblem(s; solver = HiGHS.Optimizer)
+    dual_ldr_coupling_subproblem(s; solver = HiGHS.Optimizer)
 
-The feasibility subproblem of the compact dual-LDR decomposition: every
+The feasibility subproblem of `dual_ldr_benders(s; slacks = :coupling)`: every
 scenario's primal variables -- `volume`, `hydro`, `spill`, `termos` and `θ`,
-bounded exactly as in `basis_function_ldr`, plus the slack `cuts_slack >= 0`
--- and the gaps measuring how far each one's basis-weighted moment is from a
-fixed copy of the master's moments.
+bounded exactly as in `primal_ldr`, plus the slack `cuts_slack >= 0` -- and the
+gaps measuring how far each one's basis-weighted moment is from a fixed copy
+of the master's moments.
 
 Unlike `dual_ldr_ms_subproblem`, this has to check `volume`, `hydro`, `spill`,
 `termos` and `θ` too, since they now carry their own bounds directly (see
-`basis_function_dual_ldr_compact`'s docstring) instead of delegating to a
-separately-relaxed slack -- but water balance, demand balance and the
-future-cost cuts stay out of it entirely: those are exact algebraic relations
-between moments in the master already, needing no realization of their own.
-Each family here is independent of the others, so nothing couples them beyond
-sharing the same L1 objective; `feasibility_mode!` (shared with the two other
-decompositions) is the only mode this needs.
+`dual_ldr`'s docstring) instead of delegating to a separately-relaxed slack --
+but water balance, demand balance and the future-cost cuts stay out of it
+entirely: those are exact algebraic relations between moments in the master
+already, needing no realization of their own. Each family here is independent
+of the others, so nothing couples them beyond sharing the same L1 objective;
+`feasibility_mode!` (shared with the other subproblems of this file) is the
+only mode this needs.
 """
-function compact_moments_subproblem(s::Sample; solver = HiGHS.Optimizer)
+function dual_ldr_coupling_subproblem(s::Sample; solver = HiGHS.Optimizer)
     sub = Model(solver)
     set_silent(sub)
     (; problem, T, probs, Φ) = s
     n_scen = scenario_count(s)
     K = basis_count(s)
 
-    # Every scenario's primal variables, exactly as in basis_function_ldr / _compact
+    # Every scenario's primal variables, exactly as in dual_ldr(s; slacks = :coupling)
     @variables(sub, begin
         0 <= volume[1:T,1:n_scen] <= problem.hydro_capacity
         0 <= hydro[1:T,1:n_scen] <= problem.hydro_generation
@@ -1300,8 +1102,8 @@ function compact_moments_subproblem(s::Sample; solver = HiGHS.Optimizer)
     end)
 
     # Fixed copy of the master's moments, refreshed every iteration
-    mts = add_compact_moments!(sub, s)
-    params = compact_moments_flat(mts)
+    mts = add_coupling_moments!(sub, s)
+    params = coupling_moments_flat(mts)
     fix.(params, 0.0; force = true)
 
     # Gap between each moment and the target, split into positive and negative
@@ -1342,67 +1144,30 @@ function compact_moments_subproblem(s::Sample; solver = HiGHS.Optimizer)
 end
 
 """
-    basis_function_dual_ldr_compact_benders(s; kwargs...)
+    dual_ldr_benders_loop!(master, coupling, sub; max_iterations, feasibility_tol, verbose)
 
-Solve the model of `basis_function_dual_ldr_compact` by Benders decomposition:
-the moment matrices stay in a master problem (linked by the exact algebraic
-relations of water balance, demand balance and the future-cost cuts), and a
-single feasibility subproblem (`compact_moments_subproblem`) checks whether
-they are jointly achievable by the primal scenario variables, contributing a
-feasibility cut when they are not. Accepts the same `solver` as
-`basis_function_ldr`, plus
+The feasibility-cut loop shared by both modes of `dual_ldr_benders`: neither
+needs an epigraph, since the master's own objective is already a valid lower
+bound on `dual_ldr`'s value at every iteration (see the comment above), so all
+the loop has to do is check whether the master's `coupling` moments -- `M_s`
+under `slacks = :all`, every one of `add_coupling_moments!`'s under
+`slacks = :coupling` -- are jointly achievable in `sub`, adding a feasibility
+cut when they are not.
 
-  * `max_iterations`, `feasibility_tol`: stop when the subproblem's violation
-    is within tolerance, or after so many iterations;
-  * `verbose`: print the bound and the violation of every iteration.
+Before enough cuts restrict `coupling`, the master can be only the balance
+equations on an otherwise free `coupling` and typically unbounded
+(`DUAL_INFEASIBLE`) rather than merely loose -- unlike the monolithic model,
+where every scenario's own slacks are individually sign-restricted. Since the
+achievable-`coupling` cone is positively homogeneous, the unbounded ray HiGHS
+reports in that case is itself a valid point to feed `sub`, and a positive
+violation there yields a homogeneous cut that removes the whole ray, not just
+one point on it; a zero violation instead means the ray is genuine, and the
+dual LDR really is unbounded below for this basis (see `dual_ldr`'s
+docstring).
 
-As with `basis_function_dual_ldr_benders`, `M_x` is a moment, not a decision,
-so there is no first-stage policy to report; the master's objective at every
-iteration is already a valid lower bound on `basis_function_dual_ldr_compact`'s
-value, exact as soon as the subproblem reports no violation. Unlike that
-decomposition, though, this master's objective is bounded below from the
-start (see the comment above), so it should not need unbounded-ray handling.
-Returns `(; Obj, dt)`, plus whether the loop `converged`, its `iterations`,
-the number of feasibility `cuts`, and the `master` and `subproblem` models.
+Returns `(; Obj, dt, converged, iterations, cuts)`.
 """
-function basis_function_dual_ldr_compact_benders(
-    s::Sample;
-    solver = HiGHS.Optimizer,
-    max_iterations = 500,
-    feasibility_tol = 1e-6,
-    verbose = false,
-)
-    (; problem, T, inflow, probs, Φ, φ̄) = s
-
-    # First stage: the moment matrices, bounded as described above
-    master = Model(solver)
-    set_silent(master)
-    mts = add_compact_moments!(master, s)
-    add_compact_moment_bounds!(master, mts, s)
-    Mflat = compact_moments_flat(mts)
-    volume_mx, hydro_mx, spill_mx, termos_mx, θ_mx, cuts_mx =
-        mts.volume_mx, mts.hydro_mx, mts.spill_mx, mts.termos_mx, mts.θ_mx, mts.cuts_mx
-
-    for t in 1:T
-        previous = t == 1 ? problem.initial_volume .* φ̄ : volume_mx[t-1,:]
-        @constraint(master, volume_mx[t,:] .- previous .- dual_ldr_row(probs, Φ, inflow[t,:]) .+
-            hydro_mx[t,:] .+ spill_mx[t,:] .== 0)
-        @constraint(master, hydro_mx[t,:] .+ sum(termos_mx[i,t,:] for i in 1:problem.termo_count) .-
-            problem.stage_demands[t] .* φ̄ .== 0)
-    end
-    for i in 1:problem.cuts_count
-        @constraint(master, cuts_mx[i,:] .+ problem.cuts_coeff[i] .* volume_mx[T,:] .- θ_mx .+
-            problem.cuts_inter[i] .* φ̄ .== 0)
-    end
-    # Costs do not depend on the scenario, so the objective only needs the
-    # mean of x(ξ_k) -- the first column of each moment, since L₁(ξ) ≡ 1.
-    @objective(master, Min,
-        sum(problem.termo_costs[i] * termos_mx[i,t,1] for i in 1:problem.termo_count, t in 1:T) +
-        θ_mx[1])
-
-    # Second stage: one feasibility subproblem, covering every scenario
-    sub = compact_moments_subproblem(s; solver)
-
+function dual_ldr_benders_loop!(master, coupling, sub; max_iterations, feasibility_tol, verbose)
     lower = -Inf
     converged, iterations, cuts, dt = false, 0, 0, 0.0
     for iteration in 1:max_iterations
@@ -1410,6 +1175,8 @@ function basis_function_dual_ldr_compact_benders(
         dt += @elapsed optimize!(master)
         status = termination_status(master)
         if status == INFEASIBLE
+            # Feasibility cuts have exhausted every coupling value: the basis
+            # cannot represent a feasible dual multiplier at all.
             verbose && println("master problem is INFEASIBLE")
             lower, converged = Inf, true
             break
@@ -1417,46 +1184,154 @@ function basis_function_dual_ldr_compact_benders(
             verbose && println("master problem is $status")
             break
         end
-        M̄ = value.(Mflat)
+        coupling_value = value.(coupling)
 
-        fix.(sub.ext[:params], M̄; force = true)
+        fix.(sub.ext[:params], coupling_value; force = true)
         feasibility_mode!(sub)
         dt += @elapsed optimize!(sub)
         termination_status(sub) == OPTIMAL ||
             error("feasibility subproblem is $(termination_status(sub))")
         violation = objective_value(sub)
 
-        if status == OPTIMAL
-            lower = objective_value(master)
-        end
+        status == OPTIMAL && (lower = objective_value(master))
         verbose && println("iteration $iteration: " *
             (status == OPTIMAL ? "bound $(round(lower; digits=2))" : "master unbounded") *
             ", violation $(round(violation; digits=6)), $cuts cuts so far")
         if violation <= feasibility_tol
             converged = true
-            status == DUAL_INFEASIBLE && (lower = -Inf)
+            if status == DUAL_INFEASIBLE
+                # A feasible ray: this basis leaves the dual LDR genuinely
+                # unbounded below (see `dual_ldr`'s docstring), not merely
+                # under-cut.
+                lower = -Inf
+            end
             break
         end
-        @constraint(master, 0 >= subproblem_cut(violation, sub, Mflat, M̄))
+        @constraint(master, 0 >= subproblem_cut(violation, sub, coupling, coupling_value))
         cuts += 1
     end
+    return (; Obj = lower, dt, converged, iterations, cuts)
+end
 
-    return (;
-        Obj = lower,
-        dt,
-        converged,
-        iterations,
-        cuts,
-        master,
-        subproblem = sub,
-    )
+"""
+    dual_ldr_benders(s; slacks = :all, solver = HiGHS.Optimizer, kwargs...)
+
+Solve the model of `dual_ldr(s; slacks)` by Benders decomposition: the moment
+matrices stay in a master problem, and a feasibility subproblem checks whether
+they are jointly achievable, contributing a feasibility cut when they are not
+(see the comment above). Accepts the same `solver` as `primal_ldr`, plus
+
+  * `slacks`: `:all` keeps `M_x` and `M_s` in the master and checks `M_s`
+    against `dual_ldr_ms_subproblem`; `:coupling` keeps only the moments of
+    `dual_ldr(s; slacks = :coupling)`, bounded directly, and checks them
+    against `dual_ldr_coupling_subproblem`;
+  * `max_iterations`, `feasibility_tol`: stop when the subproblem's violation
+    is within tolerance, or after so many iterations;
+  * `verbose`: print the bound and the violation of every iteration.
+
+This one never produces a rule -- `M_x` is a *moment*, not a decision, so
+there is no first-stage policy to report -- and its master's objective at
+every iteration is already a valid lower bound on `dual_ldr(s; slacks)`'s
+value, exact as soon as the subproblem reports no violation. Under
+`slacks = :coupling` the master's objective is bounded below from the start
+(see the comment above), so it should not need the unbounded-ray handling
+`slacks = :all` does. Returns `(; Obj, dt)`, matching the lower bound to the
+other methods' `Obj` field, plus whether the loop `converged`, its
+`iterations`, the number of feasibility `cuts`, and the `master` and
+`subproblem` models.
+"""
+function dual_ldr_benders(
+    s::Sample;
+    slacks = :all,
+    solver = HiGHS.Optimizer,
+    max_iterations = 500,
+    feasibility_tol = 1e-6,
+    verbose = false,
+)
+    slacks in (:all, :coupling) ||
+        throw(ArgumentError("slacks must be :all or :coupling"))
+    (; problem, T, inflow, probs, Φ, φ̄) = s
+    K = basis_count(s)
+
+    # First stage: the moment matrices, free in either mode.
+    master = Model(solver)
+    set_silent(master)
+    @variables(master, begin
+        volume_mx[1:T,1:K]
+        hydro_mx[1:T,1:K]
+        spill_mx[1:T,1:K]
+        termos_mx[1:problem.termo_count,1:T,1:K]
+        θ_mx[1:K]
+    end)
+
+    if slacks === :all
+        # Any M_x is achievable by some free x(ξ_k) (see the comment above),
+        # so it needs no subproblem; M_s does, and is the only coupling the
+        # subproblem below is given.
+        r = active_rank(Φ, probs)
+        r == K || @warn "the basis matrix Φ is rank-deficient on the positive-probability " *
+            "scenarios ($r < $K): M_x is then under-determined by the balance constraints " *
+            "alone, and would need the extra null-space rows Dual_scenarios.tex describes " *
+            "(not implemented here)."
+        Ms = add_ms_moments!(master, s)
+        volume_hi_ms, volume_lo_ms, hydro_hi_ms, hydro_lo_ms, spill_lo_ms, termos_hi_ms, termos_lo_ms, θ_lo_ms, cuts_mx =
+            master[:volume_hi_ms], master[:volume_lo_ms], master[:hydro_hi_ms], master[:hydro_lo_ms],
+            master[:spill_lo_ms], master[:termos_hi_ms], master[:termos_lo_ms], master[:θ_lo_ms], master[:cuts_ms]
+        coupling = Ms
+    else
+        # volume, hydro, spill, termos and θ are bounded directly in
+        # dual_ldr(s; slacks = :coupling), so M_x needs the cheap necessary
+        # bounds `add_coupling_moment_bounds!` gives it instead. The other
+        # five moments are already declared above; only cuts_mx is new here.
+        @variable(master, cuts_mx[1:problem.cuts_count,1:K])
+        mts = (; volume_mx, hydro_mx, spill_mx, termos_mx, θ_mx, cuts_mx)
+        add_coupling_moment_bounds!(master, mts, s)
+        coupling = coupling_moments_flat(mts)
+    end
+
+    for t in 1:T
+        previous = t == 1 ? problem.initial_volume .* φ̄ : volume_mx[t-1,:]
+        @constraint(master, volume_mx[t,:] .- previous .- dual_ldr_row(probs, Φ, inflow[t,:]) .+
+            hydro_mx[t,:] .+ spill_mx[t,:] .== 0)
+        @constraint(master, hydro_mx[t,:] .+ sum(termos_mx[i,t,:] for i in 1:problem.termo_count) .-
+            problem.stage_demands[t] .* φ̄ .== 0)
+        if slacks === :all
+            @constraint(master, volume_mx[t,:] .+ volume_hi_ms[t,:] .- problem.hydro_capacity .* φ̄ .== 0)
+            @constraint(master, volume_lo_ms[t,:] .- volume_mx[t,:] .== 0)
+            @constraint(master, hydro_mx[t,:] .+ hydro_hi_ms[t,:] .- problem.hydro_generation .* φ̄ .== 0)
+            @constraint(master, hydro_lo_ms[t,:] .- hydro_mx[t,:] .== 0)
+            @constraint(master, spill_lo_ms[t,:] .- spill_mx[t,:] .== 0)
+            for i in 1:problem.termo_count
+                @constraint(master, termos_mx[i,t,:] .+ termos_hi_ms[i,t,:] .-
+                    problem.termo_generations[i] .* φ̄ .== 0)
+                @constraint(master, termos_lo_ms[i,t,:] .- termos_mx[i,t,:] .== 0)
+            end
+        end
+    end
+    slacks === :all && @constraint(master, θ_lo_ms .- θ_mx .== 0)
+    for i in 1:problem.cuts_count
+        @constraint(master, cuts_mx[i,:] .+ problem.cuts_coeff[i] .* volume_mx[T,:] .- θ_mx .+
+            problem.cuts_inter[i] .* φ̄ .== 0)
+    end
+    # Costs do not depend on the scenario, so the objective only needs the
+    # mean of x(ξ_k) -- the first column of M_x, since L₁(ξ) ≡ 1 (see the
+    # comment above and `basis_values`).
+    @objective(master, Min,
+        sum(problem.termo_costs[i] * termos_mx[i,t,1] for i in 1:problem.termo_count, t in 1:T) +
+        θ_mx[1])
+
+    # Second stage: one feasibility subproblem, covering every scenario
+    sub = slacks === :all ? dual_ldr_ms_subproblem(s; solver) : dual_ldr_coupling_subproblem(s; solver)
+
+    result = dual_ldr_benders_loop!(master, coupling, sub; max_iterations, feasibility_tol, verbose)
+    return (; result..., master, subproblem = sub)
 end
 
 # ---------------------------------------------------------------------------
 # Dual-side (Lagrangian) solution of the compact dual LDR
 #
-# Both Benders decompositions above keep the moment matrices in the master and
-# ask a subproblem whether they are achievable.  That question is hopeless as a
+# Both modes of the Benders decomposition above keep the moment matrices in the
+# master and ask a subproblem whether they are achievable.  That question is hopeless as a
 # cutting-plane problem: the achievable moments of a single family -- say
 # `hydro`, with `0 <= hydro(ξ_k) <= hydro_generation` -- are the zonotope
 #
@@ -1464,7 +1339,7 @@ end
 #
 # a Minkowski sum of `n_scen` segments, whose facets number
 # O(binomial(n_scen-1, K-1)) -- around 10^9 of them for `n_scen = 100`, `K = 7`.
-# `add_compact_moment_bounds!` is exactly its bounding box, and one aggregated
+# `add_coupling_moment_bounds!` is exactly its bounding box, and one aggregated
 # L1 cut per iteration never gets appreciably past that box, which is why the
 # bound of those experiments sits at the expected-value solution however long
 # they run.
@@ -1478,10 +1353,10 @@ end
 #   dual LDR value = max_Z Σ_k p_k φ_k(Z L(ξ_k)),
 #   φ_k(z) = min_{y_k ∈ Y_k} [ c' x(ξ_k) + z' (A x(ξ_k) + s(ξ_k) - b(ξ_k)) ],
 #
-# with `Y_k` the box of `basis_function_dual_ldr_compact` (every decision at its
-# original bounds, plus `cuts_slack >= 0`).  Each `φ_k` is concave and piecewise
+# with `Y_k` the box of `dual_ldr(s; slacks = :coupling)` (every decision at
+# its original bounds, plus `cuts_slack >= 0`).  Each `φ_k` is concave and piecewise
 # linear in `z`, and because `Y_k` is a *box* its value and its minimizer are
-# pure arithmetic (`dual_ldr_scenario_lagrangian`): every variable goes to the
+# pure arithmetic (`scenario_lagrangian`): every variable goes to the
 # bound its reduced cost asks for, and a negative reduced cost on one of the
 # variables that is unbounded above -- `spill`, `θ`, `cuts_slack` -- means
 # φ_k = -∞, i.e. `z` is dual-infeasible for that scenario.  No LP is solved per
@@ -1517,7 +1392,7 @@ demand_row(T, t) = T + t
 cut_row(T, i) = 2T + i
 
 """
-    dual_ldr_scenario_lagrangian(s, k, z; ray_tol = 1e-9)
+    scenario_lagrangian(s, k, z; ray_tol = 1e-9)
 
 `φ_k(z)`, the Lagrangian of the dispatch problem of scenario `k` of the sample
 `s` at the multiplier `z = Z L(ξ_k)` (ordered as `balance_row`, `demand_row`,
@@ -1545,7 +1420,7 @@ Returns `(; value, cost, residual, rays, ...)` where `residual` is the
 scenario's row residual `A x + s - b` at the minimizer -- the supergradient
 this scenario contributes -- and `value = cost + z'residual`.
 """
-function dual_ldr_scenario_lagrangian(s::Sample, k, z; ray_tol = 1e-9)
+function scenario_lagrangian(s::Sample, k, z; ray_tol = 1e-9)
     (; problem, T) = s
     inflow = view(s.inflow, :, k)
     nc = problem.cuts_count
@@ -1599,19 +1474,19 @@ function dual_ldr_scenario_lagrangian(s::Sample, k, z; ray_tol = 1e-9)
 end
 
 """
-    dual_ldr_lagrangian(s, Z; ray_tol = 1e-9)
+    lagrangian(s, Z; ray_tol = 1e-9)
 
 The Lagrangian `Σ_k p_k φ_k(Z L(ξ_k))` of the whole sample `s` at the dual
 decision rule `Z` -- a valid lower bound on the dual LDR value, hence on the
 sampled primal, for *any* `Z` -- together with every scenario's evaluation (see
-`dual_ldr_scenario_lagrangian`).  `-Inf` as soon as one scenario finds `Z`
+`scenario_lagrangian`).  `-Inf` as soon as one scenario finds `Z`
 dual-infeasible.
 """
-function dual_ldr_lagrangian(s::Sample, Z; ray_tol = 1e-9)
+function lagrangian(s::Sample, Z; ray_tol = 1e-9)
     probs = s.probs
     n_scen = scenario_count(s)
     zs = Z * s.Φ'   # column k is z(ξ_k) = Z L(ξ_k)
-    scenarios = [dual_ldr_scenario_lagrangian(s, k, view(zs,:,k); ray_tol)
+    scenarios = [scenario_lagrangian(s, k, view(zs,:,k); ray_tol)
                  for k in 1:n_scen]
     value = all(scenario -> isfinite(scenario.value), scenarios) ?
         sum(probs[k] * scenarios[k].value for k in 1:n_scen) : -Inf
@@ -1622,8 +1497,8 @@ end
     lagrangian_moment_residual(s, scenarios)
 
 `Σ_k p_k (A x(ξ_k) + s(ξ_k) - b(ξ_k)) L(ξ_k)'` at the Lagrangian minimizers
-`scenarios` (the field of the same name of `dual_ldr_lagrangian`): the
-supergradient of `dual_ldr_lagrangian` with respect to `Z`, which is exactly the
+`scenarios` (the field of the same name of `lagrangian`): the
+supergradient of `lagrangian` with respect to `Z`, which is exactly the
 moment residual the Benders masters carried as variables.  Requires every
 scenario to be dual-feasible.
 """
@@ -1631,11 +1506,11 @@ lagrangian_moment_residual(s::Sample, scenarios) =
     sum(s.probs[k] .* scenarios[k].residual * s.Φ[k,:]' for k in eachindex(s.probs))
 
 """
-    basis_function_dual_ldr_lagrangian(s; kwargs...)
+    dual_ldr_lagrangian(s; kwargs...)
 
-Solve the model of `basis_function_dual_ldr_compact` from the dual side, by
+Solve the model of `dual_ldr(s; slacks = :coupling)` from the dual side, by
 cutting planes on the dual decision rule `Z` itself (see the comment above).
-Accepts the same `solver` as `basis_function_ldr`, plus
+Accepts the same `solver` as `primal_ldr`, plus
 
   * `cut_mode`: `:multi` keeps one epigraph variable per scenario, so every
     iteration adds `n_scen` cuts and the model of the Lagrangian is sharp;
@@ -1682,7 +1557,7 @@ two coincide at convergence.  Also returns the multiplier
 matrix `Z` attaining `Obj`, whether the loop `converged`, its `iterations`, the
 number of `cuts` and `rays` generated, `dt`, and the `master` model.
 """
-function basis_function_dual_ldr_lagrangian(
+function dual_ldr_lagrangian(
     s::Sample;
     solver = HiGHS.Optimizer,
     cut_mode = :multi,
@@ -1922,7 +1797,7 @@ function basis_function_dual_ldr_lagrangian(
     # would be unbounded above
     dt = 0.0
     center = zeros(nrows, K)
-    lag = dual_ldr_lagrangian(s, center; ray_tol)
+    lag = lagrangian(s, center; ray_tol)
     add_cuts!(lag)
     best, best_Z = lag.value, copy(center)
 
@@ -1962,7 +1837,7 @@ function basis_function_dual_ldr_lagrangian(
             (upper = min(upper, objective_value(master)))
         pruned = status == OPTIMAL ? prune_cuts!() : 0
 
-        eval_dt = @elapsed lag = dual_ldr_lagrangian(s, Z̄; ray_tol)
+        eval_dt = @elapsed lag = lagrangian(s, Z̄; ray_tol)
         cut_dt = @elapsed begin
             n_new_rays = add_rays!(lag)
             add_cuts!(lag, epigraph)
@@ -2042,7 +1917,7 @@ end
 #
 # Unlike the moment masters, this master is always feasible and bounded -- the
 # constant alone bounds it below -- so it needs neither the cheap moment bounds
-# of `add_compact_moment_bounds!` nor any unbounded-ray handling.  Its
+# of `add_coupling_moment_bounds!` nor any unbounded-ray handling.  Its
 # iterates, though, are upper bounds on the dual LDR value and so are *not*
 # valid lower bounds on the sampled primal until it converges, which is why
 # every round also reports the Lagrangian of its own multipliers: that one is
@@ -2169,13 +2044,13 @@ function coupling_multipliers(rows, target, lagrangian; tol = 1e-6)
 end
 
 """
-    basis_function_dual_ldr_column_generation(s; kwargs...)
+    dual_ldr_column_generation(s; kwargs...)
 
-Solve the model of `basis_function_dual_ldr_compact` by generating scenarios:
+Solve the model of `dual_ldr(s; slacks = :coupling)` by generating scenarios:
 a working set keeps its scenario blocks as variables and every other scenario is
 pinned to its own deterministic optimum, which grows the working set with the
 scenarios whose Lagrangian gap says they would lower the objective (see the
-comment above).  Accepts the same `solver` as `basis_function_ldr`, plus
+comment above).  Accepts the same `solver` as `primal_ldr`, plus
 
   * `initial`: the starting working set, one scenario by default -- which makes
     the first bound the wait-and-see value;
@@ -2186,12 +2061,12 @@ Returns `Obj`, the restricted primal's value: an upper bound on the dual LDR
 value, decreasing every round and exact once no scenario is mispriced.  Since
 that is *not* a valid lower bound on the sampled primal before convergence,
 `ObjBound` reports the best Lagrangian of the multipliers priced along the way,
-which is (see `dual_ldr_lagrangian`).  Also returns the `wait_and_see` value the
+which is (see `lagrangian`).  Also returns the `wait_and_see` value the
 first round starts from, whether the loop `converged`, its `rounds`, the
 `active` working set, the worst remaining `gap`, the multipliers `Z`, `dt` and
 the last restricted `master`.
 """
-function basis_function_dual_ldr_column_generation(
+function dual_ldr_column_generation(
     s::Sample;
     solver = HiGHS.Optimizer,
     initial = nothing,
@@ -2225,11 +2100,11 @@ function basis_function_dual_ldr_column_generation(
         # decision rule, and the Lagrangian of the active scenarios alone is
         # what identifies their sign.
         Z = coupling_multipliers(restricted.rows, upper - constant,
-            Z -> dual_ldr_lagrangian(subsample(s, active), Z).value)
+            Z -> lagrangian(subsample(s, active), Z).value)
 
         # Pricing: the same Lagrangian, now over the whole sample -- a valid
         # lower bound as a by-product
-        lag = dual_ldr_lagrangian(s, Z)
+        lag = lagrangian(s, Z)
         lower = max(lower, lag.value)
         gaps = [active[k] ? -Inf : v[k] - lag.scenarios[k].value for k in 1:n_scen]
         gap = maximum(gaps)
@@ -2276,7 +2151,7 @@ end
 # no recourse.  Generating the rows instead attacks that directly, and two features
 # of the model make it a good fit.
 #
-# First, substituting the rule into the objective of `basis_function_ldr` gives
+# First, substituting the rule into the objective of `primal_ldr` gives
 #
 #   Σ_i,t,k p_k c_i termos[i,t,k] + Σ_k p_k θ[k]
 #     = Σ_i,t,j c_i termos_ldr[i,t,j] φ̄_j + Σ_j θ_ldr[j] φ̄_j,   φ̄_j = Σ_k p_k Φ[k,j]
@@ -2384,7 +2259,7 @@ every decision and the future-cost rows, plus -- when `equalities` is
 `:per_scenario` -- its water balance and demand rows.  `inflow` is the
 scenario's inflow per stage and `basis` its row of the basis matrix, which need
 not come from the sample `s` itself (see the aggregate rows of
-`basis_function_ldr_scenario_generation`).
+`primal_ldr_scenario_generation`).
 """
 function add_scenario_rows!(master, s::Sample, inflow, basis; equalities = :per_scenario)
     (; problem, T) = s
@@ -2459,16 +2334,16 @@ function add_coefficientwise_equalities!(master, s::Sample)
 end
 
 """
-    basis_function_ldr_scenario_generation(s; kwargs...)
+    primal_ldr_scenario_generation(s; kwargs...)
 
-Solve the model of `basis_function_ldr` by scenario generation: a master problem
+Solve the model of `primal_ldr` by scenario generation: a master problem
 over the decision-rule coefficients carries the exact objective of the whole
 sample and the rows of a working set of scenarios, which grows with the
 scenarios the current rule violates (see the comment above).  Accepts the same
-`solver` as `basis_function_ldr`, plus
+`solver` as `primal_ldr`, plus
 
   * `equalities`: `:per_scenario` generates the water balance and the demand
-    with each scenario, and reproduces `basis_function_ldr` exactly;
+    with each scenario, and reproduces `primal_ldr` exactly;
     `:coefficientwise` imposes them for every realization up front, which is the
     same model whenever `Φ` has full column rank on its positive-probability
     scenarios (`active_rank`) and a stronger one when it does not -- in which
@@ -2486,13 +2361,13 @@ scenarios the current rule violates (see the comment above).  Accepts the same
     every round.
 
 Returns the `(; Obj, Bound, H₁, V₁, T₁, dt)` fields of the other solution
-methods -- see `basis_ldr_generation_solution` for a `run_comparison` row -- plus
+methods -- see `primal_ldr_generation_solution` for a `run_comparison` row -- plus
 whether the loop `converged`, its number of `rounds`, the `active` scenarios,
 the fitted `coefficients` and the `master` model.  `Obj` is exact rather than a
 sample estimate: the cost of a rule is affine, so the master objective at
 termination *is* the expected cost of the rule over the whole sample.
 """
-function basis_function_ldr_scenario_generation(
+function primal_ldr_scenario_generation(
     s::Sample;
     solver = HiGHS.Optimizer,
     equalities = :per_scenario,
@@ -2611,9 +2486,9 @@ function basis_function_ldr_scenario_generation(
 end
 
 """
-    basis_ldr_generation_solution(problem, basis = BP2; T, scenarios = 100, rng, kwargs...)
+    primal_ldr_generation_solution(problem, basis = BP2; T, scenarios = 100, rng, kwargs...)
 
-`basis_function_ldr_scenario_generation` on a fresh `Sample(problem, basis; T,
+`primal_ldr_scenario_generation` on a fresh `Sample(problem, basis; T,
 scenarios, rng)`, reduced to the fields `run_comparison` tabulates, since every
 other field of the full result would become a column of the table -- a JuMP
 model among them.
@@ -2623,7 +2498,7 @@ stage_count(problem)`: `evaluate_policy` scores the stage-2 and stage-3 recourse
 of the first-stage decisions, which a shorter horizon would leave out of the
 rule.
 """
-function basis_ldr_generation_solution(
+function primal_ldr_generation_solution(
     problem::HydroProblem,
     basis = BP2;
     T = stage_count(problem),
@@ -2632,31 +2507,31 @@ function basis_ldr_generation_solution(
     kwargs...,
 )
     s = Sample(problem, basis; T, scenarios, rng)
-    sol = basis_function_ldr_scenario_generation(s; kwargs...)
+    sol = primal_ldr_scenario_generation(s; kwargs...)
     return (; sol.Obj, sol.Bound, sol.H₁, sol.V₁, sol.T₁, sol.dt)
 end
 
 """
-    compare_basis_function_ldr(s; kwargs...)
+    compare_primal_ldr(s; kwargs...)
 
-Solve the monolithic basis-function LDR model, its Benders decomposition and its
+Solve the monolithic primal LDR model, its Benders decomposition and its
 scenario generation in both equality modes, all on the sample `s`.  Keyword
 arguments of the two decompositions go in the `benders` and `generation` named
 tuples.
 """
-function compare_basis_function_ldr(
+function compare_primal_ldr(
     s::Sample;
     solver = HiGHS.Optimizer,
     verbose = false,
     benders = (;),
     generation = (;),
 )
-    full = basis_function_ldr(s; solver)
+    full = primal_ldr(s; solver)
     dt_full = @elapsed optimize!(full)
 
-    bend = basis_function_ldr_benders(s; solver, verbose, benders...)
-    gen = basis_function_ldr_scenario_generation(s; solver, verbose, generation...)
-    gen_cw = basis_function_ldr_scenario_generation(
+    bend = primal_ldr_benders(s; solver, verbose, benders...)
+    gen = primal_ldr_scenario_generation(s; solver, verbose, generation...)
+    gen_cw = primal_ldr_scenario_generation(
         s; solver, verbose, generation..., equalities = :coefficientwise
     )
 

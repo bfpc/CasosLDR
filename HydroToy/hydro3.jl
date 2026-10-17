@@ -471,12 +471,12 @@ function compare_methods(
         ["SDDP ($n x 100 samples)" => p -> sddp_solution(p, [1, n, 100]) for n in sample_sizes]
         [
             "Basis-LDR (bp2, $n scenarios)" =>
-                p -> basis_ldr_generation_solution(p, BP2; scenarios = n)
+                p -> primal_ldr_generation_solution(p, BP2; scenarios = n)
             for n in generation_sizes
         ]
         [
             "Basis-LDR (pw3, $n scenarios)" =>
-                p -> basis_ldr_generation_solution(p, PW3; scenarios = n)
+                p -> primal_ldr_generation_solution(p, PW3; scenarios = n)
             for n in generation_sizes
         ]
     ]
