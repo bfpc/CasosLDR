@@ -9,7 +9,7 @@ x^d_t(\xi) = \sum_{j=1}^{K} X^{d}_{t,j}\, \varphi_j(\xi),
 $$
 
 with one coefficient $X^{d}_{t,j}$ per decision, stage and basis function, and non-anticipativity fixing $X^{d}_{t,j} = 0$ whenever $\varphi_j$ depends on inflows revealed after stage $t$.
-`basis_function_ldr` writes this as a monolithic LP: one copy of the dispatch problem per sampled scenario, every copy tied to the same coefficients.
+`primal_ldr` writes this as a monolithic LP: one copy of the dispatch problem per sampled scenario, every copy tied to the same coefficients.
 With $\Phi_{kj} = \varphi_j(\xi^k)$ the basis matrix of the sample (`basis_values`) and $x$ the coefficients flattened (`ldr_coefficients`), the model is
 
 $$
@@ -26,7 +26,7 @@ natural first stage. Two decompositions of that split are implemented, and they
 are worth reading together because the second one improves the first one.
 
 Both reproduce the monolithic optimum exactly — verified by
-`compare_basis_function_ldr`, which runs all of them on the same scenarios.
+`compare_primal_ldr`, which runs all of them on the same scenarios.
 
 ## What the split implies
 
@@ -44,12 +44,12 @@ This has two consequences:
 
 The main difficulty of decomposing this model is describing that polyhedron.
 
-## 1. Benders decomposition (`basis_function_ldr_benders`)
+## 1. Benders decomposition (`primal_ldr_benders`)
 
 Master: the coefficients $X$, plus one epigraph variable $\alpha_k \ge 0$ per
 scenario, minimizing $\sum_k p_k \alpha_k$.
 
-Subproblem (`basis_ldr_subproblem`), one per scenario, built once and re-solved:
+Subproblem (`primal_ldr_subproblem`), one per scenario, built once and re-solved:
 scenario $k$'s dispatch constraints, a **fixed copy** of $X$, and the coupling
 `decision == Σⱼ xⱼ Φₖⱼ` relaxed by non-negative slacks $s^\pm$. It is solved in
 two passes:
@@ -101,7 +101,7 @@ the violation already accepted, and if that still fails the scenario is cut off
 as infeasible using the feasibility cut. And `INFEASIBLE` from the master is a
 proof that no rule is implementable, which the loop reports rather than retries.
 
-## 2. Scenario generation (`basis_function_ldr_scenario_generation`)
+## 2. Scenario generation (`primal_ldr_scenario_generation`)
 
 Rather than approximate a scenario's feasible region with cuts, add the
 scenario's own rows, which describe it exactly.
@@ -169,7 +169,7 @@ The `equalities` keyword chooses how the water balance and the demand are
 handled.
 
 * `:per_scenario` (default) generates them with each scenario, reproducing
-  `basis_function_ldr` exactly.
+  `primal_ldr` exactly.
 * `:coefficientwise` (`add_coefficientwise_equalities!`) imposes them once per
   basis coefficient, so they hold for *every* realization and are never
   generated. This needs each stage's inflow to be a combination of the basis
@@ -260,16 +260,16 @@ $$
 
 a Minkowski sum of $K$ segments — a **zonotope** with $K$ generators, whose
 facets number $O\!\big(\binom{K-1}{\ell-1}\big)$, about $10^9$ for $K=100$,
-$\ell=7$. `add_compact_moment_bounds!` is exactly its bounding box, and one
+$\ell=7$. `add_coupling_moment_bounds!` is exactly its bounding box, and one
 aggregated L1 feasibility cut per iteration never gets appreciably past that
 box: the bound sits at the expected-value solution however long the loop runs.
-`basis_function_dual_ldr_benders` and `basis_function_dual_ldr_compact_benders`
-are kept because that is worth knowing, not because they work.
+`dual_ldr_benders` is kept, in both `slacks` modes, because that is worth
+knowing, not because either one works.
 
 A zonotope has no usable facet description — but its *support function* is
 closed form, which says to work on the dual side instead.
 
-## 4. Lagrangian cutting planes (`basis_function_dual_ldr_lagrangian`)
+## 4. Lagrangian cutting planes (`dual_ldr_lagrangian`)
 
 Dualizing the coupling rows with $Z$ — where $Z$ came from in the first place —
 separates the sample completely:
@@ -280,8 +280,8 @@ $$
 \varphi_k(z) = \min_{y_k \in Y_k}\Big[c^\top x(\xi_k) + z^\top\big(A y_k - b(\xi_k)\big)\Big],
 $$
 
-with $Y_k$ the box of `basis_function_dual_ldr_compact`. Because $Y_k$ *is* a
-box, `dual_ldr_scenario_lagrangian` evaluates $\varphi_k$ and its minimizer by
+with $Y_k$ the box of `dual_ldr(s; slacks = :coupling)`. Because $Y_k$ *is* a
+box, `scenario_lagrangian` evaluates $\varphi_k$ and its minimizer by
 arithmetic: every variable goes to the bound its reduced cost asks for, and a
 negative reduced cost on one of the variables unbounded above (`spill`, `θ`,
 `cuts_slack`) means $\varphi_k = -\infty$, i.e. $z$ is dual-infeasible for that
@@ -307,7 +307,7 @@ cuts" caps nothing on its own; and `ray_mode = :lazy`, because stating
 $K(T + \text{cuts} + 1)$ dual-feasibility rows up front is itself the expensive
 part past a few thousand scenarios.
 
-## 5. Scenario column generation (`basis_function_dual_ldr_column_generation`)
+## 5. Scenario column generation (`dual_ldr_column_generation`)
 
 The primal face of the same decomposition, and the mirror of decomposition 2:
 where that one starts from a few scenarios' *rows*, this starts from a few
@@ -378,7 +378,7 @@ because it is asymmetric: `pw3`'s **bound is exact** — the Lagrangian reaches
 not**, since `ObjBound` only updates on a master solved to optimality, so the
 run ends on the stall limit with `converged = false` and `ObjBound = Inf`. A
 valid bound that cannot prove it is still a valid bound; take the certificate
-from `basis_function_dual_ldr_column_generation`, whose master is a small,
+from `dual_ldr_column_generation`, whose master is a small,
 well-behaved LP, and pair the two.
 
 The working set of the column generation, meanwhile, grows to **nearly the whole
@@ -468,11 +468,11 @@ than against the basis.
 
 ## Which to use, on the dual side
 
-Up to a few thousand scenarios, **the monolith** (`basis_function_dual_ldr_compact`).
+Up to a few thousand scenarios, **the monolith** (`dual_ldr(s; slacks = :coupling)`).
 It is the fastest and it is exact, and the decompositions earn their keep only as
 an independent check on it — which they pass, from both sides, on both bases.
 
-Past that, **`basis_function_dual_ldr_column_generation`, stopped early**, and
+Past that, **`dual_ldr_column_generation`, stopped early**, and
 read `ObjBound` rather than `Obj`. Its restricted primal is a small
 well-behaved LP, its pricing is the closed-form Lagrangian, and that Lagrangian
 is a valid lower bound every round, so truncating it costs tightness and
@@ -481,33 +481,35 @@ converges on a genuinely sparse active set; here the working set grows with the
 sample and the right move is to stop caring about convergence and take the
 bound.
 
-`basis_function_dual_ldr_lagrangian` is the most elegant of the three — no
+`dual_ldr_lagrangian` is the most elegant of the three — no
 moment matrices, no LP per scenario, separation in $O(K)$ arithmetic — and the
 best at a hundred scenarios. It is also the one whose master is a degenerate
 cutting-plane LP, and that is what limits it. Worth reading for the structure;
 not what to run at scale.
 
-The two moment-based Benders decompositions are worth reading for the zonotope
+`dual_ldr_benders`, in either `slacks` mode, is worth reading for the zonotope
 argument and nothing else.
 
 ## Reference
 
 | Function | |
 | --- | --- |
-| `basis_function_ldr` | the monolithic model, one scenario block per sample point |
-| `basis_function_ldr_benders` | decomposition 1 |
-| `basis_ldr_subproblem`, `feasibility_mode!`, `optimality_mode!`, `subproblem_cut` | its subproblems and cuts |
-| `basis_function_ldr_scenario_generation` | decomposition 2 |
+| `primal_ldr` | the monolithic model, one scenario block per sample point |
+| `primal_ldr_benders` | decomposition 1 |
+| `primal_ldr_subproblem`, `feasibility_mode!`, `optimality_mode!`, `subproblem_cut` | its subproblems and cuts |
+| `primal_ldr_scenario_generation` | decomposition 2 |
 | `mean_basis`, `set_ldr_objective!`, `add_scenario_rows!`, `add_coefficientwise_equalities!`, `rule_values`, `scenario_violation` | its master rows and separation |
-| `basis_ldr_generation_solution` | a `run_comparison` row, used by `compare_methods` |
-| `compare_basis_function_ldr` | all of them on the same scenarios |
-| `basis_function_dual_ldr`, `basis_function_dual_ldr_compact` | the monolithic dual LDR, with a slack per row and with only the genuine ones |
-| `basis_function_dual_ldr_benders`, `basis_function_dual_ldr_compact_benders` | decomposition 3, the moment masters that do not converge |
-| `add_ms_moments!`, `add_compact_moments!`, `add_compact_moment_bounds!`, `dual_ldr_ms_subproblem`, `compact_moments_subproblem`, `dual_ldr_compact_moments` | their moments and achievability subproblems |
-| `basis_function_dual_ldr_lagrangian` | decomposition 4 |
-| `dual_ldr_scenario_lagrangian`, `dual_ldr_lagrangian`, `lagrangian_moment_residual`, `coupling_row_count`, `balance_row`, `demand_row`, `cut_row` | its closed-form evaluation and row layout |
+| `primal_ldr_generation_solution` | a `run_comparison` row, used by `compare_methods` |
+| `compare_primal_ldr` | all of them on the same scenarios |
+| `dual_ldr` | the monolithic dual LDR; `slacks = :all` for a slack per row, `:coupling` for only the genuine ones |
+| `dual_ldr_benders` | decomposition 3, the moment masters that do not converge, in both `slacks` modes |
+| `dual_ldr_benders_loop!` | the feasibility-cut loop shared by both modes |
+| `add_ms_moments!`, `dual_ldr_ms_subproblem` | `:all`'s moments and achievability subproblem |
+| `add_coupling_moments!`, `add_coupling_moment_bounds!`, `dual_ldr_coupling_subproblem`, `dual_ldr_moments` | `:coupling`'s moments and achievability subproblem |
+| `dual_ldr_lagrangian` | decomposition 4 |
+| `scenario_lagrangian`, `lagrangian`, `lagrangian_moment_residual`, `coupling_row_count`, `balance_row`, `demand_row`, `cut_row` | its closed-form evaluation and row layout |
 | `prune_cuts!`, `restricting` (both local to it) | the cut budget, and when the master's value is a bound |
-| `basis_function_dual_ldr_column_generation` | decomposition 5 |
+| `dual_ldr_column_generation` | decomposition 5 |
 | `wait_and_see_values`, `dual_ldr_restricted_primal`, `coupling_multipliers` | its ceiling, master and pricing multipliers |
 | `dual_ldr_row` | the basis-weighted average shared by every dual formulation |
 | `Basis`, `BP2`, `PW3`, `CONSTANT_BASIS`, `linear_basis` | the basis functions of a rule, with the stage each one belongs to |
@@ -522,10 +524,10 @@ of its table.
 ```julia
 julia> problem = HydroToy3.build_toy_problem();
 
-julia> HydroToy3.compare_basis_function_ldr(
+julia> HydroToy3.compare_primal_ldr(
            HydroToy3.Sample(problem, HydroToy3.BP2; scenarios = 30))
 
-julia> HydroToy3.basis_function_ldr_scenario_generation(
+julia> HydroToy3.primal_ldr_scenario_generation(
            HydroToy3.Sample(problem, HydroToy3.PW3; scenarios = 100_000);
            verbose = true)
 ```

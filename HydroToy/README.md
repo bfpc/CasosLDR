@@ -47,7 +47,7 @@ Limitations:
 
 Scenario-wise expansions of the LDR model, written out explicitly rather than through `LinearDecisionRules`:
 - over the extreme points of the uncertainty set (`extreme_point_ldr`), compatible with uniform, independent probabilities (cf `generate_extreme_points`) for each uncertainty;
-- over a sample of the scenarios, with decision rules spanned by a _set_ of piecewise-linear functions of the inflows (`basis_function_ldr`), trying to mitigate the last limitation (the current polyhedral implementation of the LDR package does not support breakpoints over a linear function of the uncertainties).
+- over a sample of the scenarios, with decision rules spanned by a _set_ of piecewise-linear functions of the inflows (`primal_ldr`), trying to mitigate the last limitation (the current polyhedral implementation of the LDR package does not support breakpoints over a linear function of the uncertainties).
 
 That last model can also be solved by two **decompositions** of its decision-rule coefficients:
 - a Benders decomposition; and
