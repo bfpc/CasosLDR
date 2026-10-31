@@ -226,18 +226,14 @@ end
 LDR model where stage-2 decisions depend on stochastic inflow.
 """
 function ldr_solution(problem::HydroProblem, n_breakpoints=0)
-    ldr = LinearDecisionRules.LDRModel(problem.solver)
+    ldr = LDRModel(problem.solver)
     set_silent(ldr)
 
-    @variable(ldr, hydro₁ >= 0, LinearDecisionRules.FirstStage)
-    @variable(ldr, termos₁[1:problem.termo_count] >= 0, LinearDecisionRules.FirstStage)
-    @variable(ldr, volume₁ >= 0, LinearDecisionRules.FirstStage)
-    @variable(ldr, spill₁ >= 0, LinearDecisionRules.FirstStage)
-    @variable(
-        ldr,
-        inflow in
-        LinearDecisionRules.Uncertainty(; distribution = problem.inflow_distr)
-    )
+    @variable(ldr, hydro₁ >= 0, Stage(1))
+    @variable(ldr, termos₁[1:problem.termo_count] >= 0, Stage(1))
+    @variable(ldr, volume₁ >= 0, Stage(1))
+    @variable(ldr, spill₁ >= 0, Stage(1))
+    @variable(ldr, inflow in Uncertainty(problem.inflow_distr))
     @variable(ldr, hydro₂ >= 0)
     @variable(ldr, termos₂[1:problem.termo_count] >= 0)
     @variable(ldr, volume₂ >= 0)
@@ -265,19 +261,17 @@ function ldr_solution(problem::HydroProblem, n_breakpoints=0)
 
     # Set breakpoints for uncertainty approximation.
     if n_breakpoints > 0
-        set_attribute(inflow, LinearDecisionRules.BreakPoints(), n_breakpoints)
+        set_attribute(inflow, BreakPoints(), n_breakpoints)
     end
 
     dt = @elapsed optimize!(ldr)
 
     return (;
         Obj = objective_value(ldr),
-        Bound = objective_value(ldr; dual = true),
-        H₁ = LinearDecisionRules.get_decision(ldr, hydro₁),
-        V₁ = LinearDecisionRules.get_decision(ldr, volume₁),
-        T₁ = [
-            LinearDecisionRules.get_decision(ldr, termos₁[i]) for i in 1:problem.termo_count
-        ],
+        Bound = objective_bound(ldr),
+        H₁ = value(hydro₁),
+        V₁ = value(volume₁),
+        T₁ = value.(termos₁),
         dt,
     )
 end

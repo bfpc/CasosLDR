@@ -97,17 +97,13 @@ end
 
 # LDR solution, with optional breakpoints for piecewise linear decision rules
 function ldr_solution(problem::NewsvendorProblem; n_breakpoints = 0)
-    ldr = LinearDecisionRules.LDRModel(problem.solver)
+    ldr = LDRModel(problem.solver)
     set_silent(ldr)
 
-    @variable(ldr, buy >= 0, LinearDecisionRules.FirstStage)
+    @variable(ldr, buy >= 0, Stage(1))
     @variable(ldr, sell >= 0)
     @variable(ldr, ret >= 0)
-    @variable(
-        ldr,
-        demand in
-        LinearDecisionRules.Uncertainty(; distribution = problem.demand_distr)
-    )
+    @variable(ldr, demand in Uncertainty(problem.demand_distr))
 
     @constraint(ldr, sell + ret <= buy)
     @constraint(ldr, sell <= demand)
@@ -122,15 +118,15 @@ function ldr_solution(problem::NewsvendorProblem; n_breakpoints = 0)
 
     # Set breakpoints
     if n_breakpoints > 0
-        set_attribute(demand, LinearDecisionRules.BreakPoints(), n_breakpoints)
+        set_attribute(demand, BreakPoints(), n_breakpoints)
     end
 
     dt = @elapsed optimize!(ldr)
 
     return (;
         Obj = objective_value(ldr),
-        Bound = objective_value(ldr; dual = true),
-        Buy = LinearDecisionRules.get_decision(ldr, buy),
+        Bound = objective_bound(ldr),
+        Buy = value(buy),
         dt,
     )
 end

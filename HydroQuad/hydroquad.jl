@@ -154,6 +154,9 @@ Out-of-sample assessment of a solution: average the stage-2 recourse over
 `n_scenarios` sampled inflows and add the first-stage cost it commits to.
 """
 function evaluate_policy(problem::HydroProblem, sol; n_scenarios = 10_000, seed = 0)
+    # No first-stage decision to evaluate (an LDR whose primal solve failed)
+    isnan(sol.V₁) && return (; H₂ = NaN, V₂ = NaN, T₂ = NaN, Perf = NaN, Std = NaN)
+
     inflows = rand(MersenneTwister(seed), problem.inflow_distr, n_scenarios)
 
     average, stderror =
@@ -211,16 +214,15 @@ function expected_value_solution(problem::HydroProblem)
 end
 
 function ldr_solution(problem::HydroProblem, n_breakpoints=0)
-    ldr = LinearDecisionRules.LDRModel(problem.solver)
+    ldr = LDRModel(problem.solver)
     set_silent(ldr)
 
-    @variable(ldr, inflow in
-             LinearDecisionRules.Uncertainty(; distribution = problem.inflow_distr))
+    @variable(ldr, inflow in Uncertainty(problem.inflow_distr))
     @variables(ldr, begin
-        0 <= hydro₁ <= problem.hydro_generation, LinearDecisionRules.FirstStage
-        0 <= termo₁ <= problem.termo_generation, LinearDecisionRules.FirstStage
-        0 <= volume₁ <= problem.hydro_capacity, LinearDecisionRules.FirstStage
-        spill₁ >= 0, LinearDecisionRules.FirstStage
+        0 <= hydro₁ <= problem.hydro_generation, Stage(1)
+        0 <= termo₁ <= problem.termo_generation, Stage(1)
+        0 <= volume₁ <= problem.hydro_capacity, Stage(1)
+        spill₁ >= 0, Stage(1)
 
         0 <= hydro₂ <= problem.hydro_generation
         0 <= termo₂ <= problem.termo_generation
@@ -248,17 +250,23 @@ function ldr_solution(problem::HydroProblem, n_breakpoints=0)
 
     # Set breakpoints for uncertainty approximation.
     if n_breakpoints > 0
-        set_attribute(inflow, LinearDecisionRules.BreakPoints(), n_breakpoints)
+        set_attribute(inflow, BreakPoints(), n_breakpoints)
     end
 
     dt = @elapsed optimize!(ldr)
 
+    # HiGHS may fail on these QPs: report NaN rather than the value of a failed
+    # solve.  A failed primal solve may still leave a rule, whose first-stage
+    # decisions are evaluated out of sample; without one, they are NaN too.
+    solved(f) = termination_status(ldr, f) in (OPTIMAL, LOCALLY_SOLVED)
+    rule(x) = has_values(ldr) ? value(x) : NaN
+
     return (;
-        Obj = objective_value(ldr),
-        Bound = objective_value(ldr; dual = true),
-        H₁ = LinearDecisionRules.get_decision(ldr, hydro₁),
-        V₁ = LinearDecisionRules.get_decision(ldr, volume₁),
-        T₁ = LinearDecisionRules.get_decision(ldr, termo₁),
+        Obj = solved(PrimalLDR()) ? objective_value(ldr) : NaN,
+        Bound = solved(DualLDR()) ? objective_bound(ldr) : NaN,
+        H₁ = rule(hydro₁),
+        V₁ = rule(volume₁),
+        T₁ = rule(termo₁),
         dt,
     )
 end

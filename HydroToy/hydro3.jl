@@ -185,10 +185,16 @@ Out-of-sample assessment of a solution: average the recourse cost over
 `n_scenarios` sampled inflows and add the first-stage cost it commits to.
 """
 function evaluate_policy(problem::HydroProblem, sol; n_scenarios = 1000, seed = 0)
-    inflows = rand(MersenneTwister(seed), problem.inflow_distr, n_scenarios)
+    rng = MersenneTwister(seed)
+    inflows = rand(rng, problem.inflow_distr, n_scenarios)
+    # Stage-3 scenarios of the recourse model, seeded too: the model is cached,
+    # so they are drawn once per problem and shared by every policy evaluated.
+    stage3_inflows = rand(rng, problem.inflow_distr, 100)
 
-    average, stderror =
-        average_scenarios(inflow -> recourse_solution(problem, sol.V₁, inflow), inflows)
+    average, stderror = average_scenarios(
+        inflow -> recourse_solution(problem, sol.V₁, inflow; stage3_inflows),
+        inflows,
+    )
 
     return (;
         H₂ = average.hydro,
@@ -243,29 +249,21 @@ end
 LDR model where stage-2 and stage-3 decisions depend on the stochastic inflows.
 """
 function ldr_solution(problem::HydroProblem, n_breakpoints=0)
-    ldr = LinearDecisionRules.LDRModel(problem.solver)
+    ldr = LDRModel(problem.solver)
     set_silent(ldr)
 
     # Uncertainties
-    @variable(
-        ldr,
-        inflow2 in
-        LinearDecisionRules.Uncertainty(; distribution = problem.inflow_distr, stage = 2)
-    )
-    @variable(
-        ldr,
-        inflow3 in
-        LinearDecisionRules.Uncertainty(; distribution = problem.inflow_distr, stage = 3)
-    )
+    @variable(ldr, inflow2 in Uncertainty(problem.inflow_distr), Stage(2))
+    @variable(ldr, inflow3 in Uncertainty(problem.inflow_distr), Stage(3))
     inflows = [problem.initial_inflow, inflow2, inflow3]
 
     # Decision variables / constraints / objective (almost equal to deterministic EV model)
-    @variable(ldr, 0 <= volume[1:3] <= problem.hydro_capacity)
-    @variable(ldr, 0 <= hydro[1:3] <= problem.hydro_generation)
-    @variable(ldr, spill[1:3] >= 0)
-    @variable(ldr, 0 <= termos[t=1:3, i=1:problem.termo_count] <= problem.termo_generations[i])
+    @variable(ldr, 0 <= volume[t=1:3] <= problem.hydro_capacity, Stage(t))
+    @variable(ldr, 0 <= hydro[t=1:3] <= problem.hydro_generation, Stage(t))
+    @variable(ldr, spill[t=1:3] >= 0, Stage(t))
+    @variable(ldr, 0 <= termos[t=1:3, i=1:problem.termo_count] <= problem.termo_generations[i], Stage(t))
 
-    @variable(ldr, θ >= 0)
+    @variable(ldr, θ >= 0, Stage(3))
 
     @constraint(ldr, volume[1] == problem.initial_volume + inflows[1] - hydro[1] - spill[1])
     @constraint(ldr, volume[2] == volume[1] + inflows[2] - hydro[2] - spill[2])
@@ -278,32 +276,20 @@ function ldr_solution(problem::HydroProblem, n_breakpoints=0)
                sum(problem.termo_costs[i] * sum(termos[:,i]) for i in 1:problem.termo_count) + θ
     )
 
-    # Stages
-    for t in 1:3
-        set_attribute(volume[t], LinearDecisionRules.Stage(t))
-        set_attribute(hydro[t], LinearDecisionRules.Stage(t))
-        set_attribute(spill[t], LinearDecisionRules.Stage(t))
-        set_attribute.(termos[t, :], [LinearDecisionRules.Stage(t)])
-    end
-    set_attribute(θ, LinearDecisionRules.Stage(3))
-
-
     # Set breakpoints for uncertainty approximation.
     if n_breakpoints > 0
-        set_attribute(inflow2, LinearDecisionRules.BreakPoints(), n_breakpoints)
-        set_attribute(inflow3, LinearDecisionRules.BreakPoints(), n_breakpoints)
+        set_attribute(inflow2, BreakPoints(), n_breakpoints)
+        set_attribute(inflow3, BreakPoints(), n_breakpoints)
     end
 
     dt = @elapsed optimize!(ldr)
 
     return (;
         Obj = objective_value(ldr),
-        Bound = objective_value(ldr; dual = true),
-        H₁ = LinearDecisionRules.get_decision(ldr, hydro[1]),
-        V₁ = LinearDecisionRules.get_decision(ldr, volume[1]),
-        T₁ = [
-            LinearDecisionRules.get_decision(ldr, termos[1,i]) for i in 1:problem.termo_count
-        ],
+        Bound = objective_bound(ldr),
+        H₁ = value(hydro[1]),
+        V₁ = value(volume[1]),
+        T₁ = value.(termos[1, :]),
         dt,
     )
 end

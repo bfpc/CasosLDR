@@ -7,4 +7,4 @@ LinearDecisionRules = "ee4db4e3-7eec-47e5-9935-9699b02754f6"
 SDDP = "f4570300-c277-11e8-125c-4912f86ce65d"
 
 [compat]
-LinearDecisionRules = ">= 0.3.0"
+LinearDecisionRules = ">= 0.4.0"
