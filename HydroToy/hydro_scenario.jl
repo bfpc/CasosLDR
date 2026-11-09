@@ -360,15 +360,15 @@ function primal_ldr(s::Sample; solver = HiGHS.Optimizer)
 end
 
 """
-    dual_ldr_row(probs, Φ, row)
+    dual_ldr_row(Φ, probs, row)
 
 The basis-weighted average of a canonical-form row over the sample: a `K`-vector,
 one entry per basis function, of `Σ_k probs[k] * row[k] * Φ[k,j]` -- what the
 scenario expansion of the dual LDR (`Dual_scenarios.tex`, eq. 93) sets to zero
 for every row of the canonical form `A x(ξ) + s(ξ) = b(ξ)`.
 """
-dual_ldr_row(probs, Φ, row) = Φ' * (probs .* row)
-dual_ldr_row(s::Sample, row) = dual_ldr_row(s.probs, s.Φ, row)
+dual_ldr_row(Φ, probs, row) = Φ' * (probs .* row)
+dual_ldr_row(s::Sample, row) = dual_ldr_row(s.Φ, s.probs, row)
 
 """
     dual_ldr(s; slacks = :all, solver = HiGHS.Optimizer)
@@ -464,9 +464,9 @@ function dual_ldr(s::Sample; slacks = :all, solver = HiGHS.Optimizer)
     # Water balance and demand balance: already equalities, no slack
     for t in 1:T
         previous = t == 1 ? fill(problem.initial_volume, n_scen) : volume[t-1,:]
-        @constraint(ldr, dual_ldr_row(probs, Φ,
+        @constraint(ldr, dual_ldr_row(Φ, probs,
             volume[t,:] .- previous .- inflow[t,:] .+ hydro[t,:] .+ spill[t,:]) .== 0)
-        @constraint(ldr, dual_ldr_row(probs, Φ,
+        @constraint(ldr, dual_ldr_row(Φ, probs,
             hydro[t,:] .+ sum(termos[i,t,:] for i in 1:problem.termo_count) .-
             problem.stage_demands[t]) .== 0)
     end
@@ -474,21 +474,21 @@ function dual_ldr(s::Sample; slacks = :all, solver = HiGHS.Optimizer)
     if slacks === :all
         # Bounds, turned into slack rows
         for t in 1:T
-            @constraint(ldr, dual_ldr_row(probs, Φ, volume[t,:] .+ volume_hi[t,:] .- problem.hydro_capacity) .== 0)
-            @constraint(ldr, dual_ldr_row(probs, Φ, volume_lo[t,:] .- volume[t,:]) .== 0)
-            @constraint(ldr, dual_ldr_row(probs, Φ, hydro[t,:] .+ hydro_hi[t,:] .- problem.hydro_generation) .== 0)
-            @constraint(ldr, dual_ldr_row(probs, Φ, hydro_lo[t,:] .- hydro[t,:]) .== 0)
-            @constraint(ldr, dual_ldr_row(probs, Φ, spill_lo[t,:] .- spill[t,:]) .== 0)
+            @constraint(ldr, dual_ldr_row(Φ, probs, volume[t,:] .+ volume_hi[t,:] .- problem.hydro_capacity) .== 0)
+            @constraint(ldr, dual_ldr_row(Φ, probs, volume_lo[t,:] .- volume[t,:]) .== 0)
+            @constraint(ldr, dual_ldr_row(Φ, probs, hydro[t,:] .+ hydro_hi[t,:] .- problem.hydro_generation) .== 0)
+            @constraint(ldr, dual_ldr_row(Φ, probs, hydro_lo[t,:] .- hydro[t,:]) .== 0)
+            @constraint(ldr, dual_ldr_row(Φ, probs, spill_lo[t,:] .- spill[t,:]) .== 0)
             for i in 1:problem.termo_count
-                @constraint(ldr, dual_ldr_row(probs, Φ,
+                @constraint(ldr, dual_ldr_row(Φ, probs,
                     termos[i,t,:] .+ termos_hi[i,t,:] .- problem.termo_generations[i]) .== 0)
-                @constraint(ldr, dual_ldr_row(probs, Φ, termos_lo[i,t,:] .- termos[i,t,:]) .== 0)
+                @constraint(ldr, dual_ldr_row(Φ, probs, termos_lo[i,t,:] .- termos[i,t,:]) .== 0)
             end
         end
-        @constraint(ldr, dual_ldr_row(probs, Φ, θ_lo .- θ) .== 0)
+        @constraint(ldr, dual_ldr_row(Φ, probs, θ_lo .- θ) .== 0)
     end
     for i in 1:problem.cuts_count
-        @constraint(ldr, dual_ldr_row(probs, Φ,
+        @constraint(ldr, dual_ldr_row(Φ, probs,
             cuts_slack[i,:] .+ problem.cuts_coeff[i] .* volume[T,:] .- θ .+ problem.cuts_inter[i]) .== 0)
     end
 
@@ -631,7 +631,7 @@ function feasibility_mode!(sub)
 end
 
 """
-    optimality_mode!(sub, slack = 0.0)
+    optimality_mode!(sub; slack = 0.0)
 
 Pin the coupling slacks to zero and minimize the scenario cost.  `slack` is the
 violation left admissible: the feasibility pass accepts a rule whose violation is
@@ -639,21 +639,21 @@ within a tolerance, and the cost of such a rule has to be priced by a subproblem
 that is not infeasible by that same tolerance.  Cuts stay valid because a larger
 `slack` only relaxes the subproblem, hence lowers the value they minorize.
 """
-function optimality_mode!(sub, slack = 0.0)
+function optimality_mode!(sub; slack = 0.0)
     set_upper_bound.(sub.ext[:gaps], slack)
     @objective(sub, Min, sub[:cost])
     return sub
 end
 
 """
-    subproblem_cut(value, sub, x, x̄)
+    subproblem_cut(sub, value, x, x̄)
 
 The affine minorant `value + g'(x - x̄)` of the subproblem's optimal value, whose
 subgradient `g` with respect to the first-stage variables is the reduced cost of
 their fixed copy inside the subproblem.  Coefficients that came out zero are
 dropped, which keeps the cuts sparse.
 """
-function subproblem_cut(value, sub, x, x̄)
+function subproblem_cut(sub, value, x, x̄)
     g = reduced_cost.(sub.ext[:params])
     cut = AffExpr(value)
     for j in eachindex(x)
@@ -739,7 +739,7 @@ function primal_ldr_benders(
             total_violation += probs[k] * violation
             # Read the feasibility cut before re-solving: it is also the
             # fallback if the cost of a borderline rule cannot be priced.
-            feasibility_cut = subproblem_cut(violation, sub, x, x̄)
+            feasibility_cut = subproblem_cut(sub, violation, x, x̄)
 
             infeasible = violation > feasibility_tol
             if !infeasible
@@ -748,7 +748,7 @@ function primal_ldr_benders(
                 if termination_status(sub) != OPTIMAL
                     # The rule only just fits this scenario: price it allowing
                     # the violation the feasibility pass already accepted.
-                    optimality_mode!(sub, feasibility_tol)
+                    optimality_mode!(sub; slack = feasibility_tol)
                     dt += @elapsed optimize!(sub)
                 end
                 # Very unlikely, but it is numerically possible that a "re-solve"
@@ -765,7 +765,7 @@ function primal_ldr_benders(
             q = objective_value(sub)
             cost += probs[k] * q
             if q > ᾱ[k] + tol * (1 + abs(q))
-                @constraint(master, α[k] >= subproblem_cut(q, sub, x, x̄))
+                @constraint(master, α[k] >= subproblem_cut(sub, q, x, x̄))
                 optimality_cuts += 1
                 cuts += 1
             end
@@ -970,26 +970,26 @@ function dual_ldr_ms_subproblem(s::Sample; solver = HiGHS.Optimizer)
         cuts_gap[1:problem.cuts_count,1:K,1:2] >= 0
     end)
     for t in 1:T
-        @constraint(sub, dual_ldr_row(probs, Φ, volume_hi[t,:]) .- sub[:volume_hi_ms][t,:] .==
+        @constraint(sub, dual_ldr_row(Φ, probs, volume_hi[t,:]) .- sub[:volume_hi_ms][t,:] .==
             volume_hi_gap[t,:,1] .- volume_hi_gap[t,:,2])
-        @constraint(sub, dual_ldr_row(probs, Φ, volume_lo[t,:]) .- sub[:volume_lo_ms][t,:] .==
+        @constraint(sub, dual_ldr_row(Φ, probs, volume_lo[t,:]) .- sub[:volume_lo_ms][t,:] .==
             volume_lo_gap[t,:,1] .- volume_lo_gap[t,:,2])
-        @constraint(sub, dual_ldr_row(probs, Φ, hydro_hi[t,:]) .- sub[:hydro_hi_ms][t,:] .==
+        @constraint(sub, dual_ldr_row(Φ, probs, hydro_hi[t,:]) .- sub[:hydro_hi_ms][t,:] .==
             hydro_hi_gap[t,:,1] .- hydro_hi_gap[t,:,2])
-        @constraint(sub, dual_ldr_row(probs, Φ, hydro_lo[t,:]) .- sub[:hydro_lo_ms][t,:] .==
+        @constraint(sub, dual_ldr_row(Φ, probs, hydro_lo[t,:]) .- sub[:hydro_lo_ms][t,:] .==
             hydro_lo_gap[t,:,1] .- hydro_lo_gap[t,:,2])
-        @constraint(sub, dual_ldr_row(probs, Φ, spill_lo[t,:]) .- sub[:spill_lo_ms][t,:] .==
+        @constraint(sub, dual_ldr_row(Φ, probs, spill_lo[t,:]) .- sub[:spill_lo_ms][t,:] .==
             spill_lo_gap[t,:,1] .- spill_lo_gap[t,:,2])
         for i in 1:problem.termo_count
-            @constraint(sub, dual_ldr_row(probs, Φ, termos_hi[i,t,:]) .- sub[:termos_hi_ms][i,t,:] .==
+            @constraint(sub, dual_ldr_row(Φ, probs, termos_hi[i,t,:]) .- sub[:termos_hi_ms][i,t,:] .==
                 termos_hi_gap[i,t,:,1] .- termos_hi_gap[i,t,:,2])
-            @constraint(sub, dual_ldr_row(probs, Φ, termos_lo[i,t,:]) .- sub[:termos_lo_ms][i,t,:] .==
+            @constraint(sub, dual_ldr_row(Φ, probs, termos_lo[i,t,:]) .- sub[:termos_lo_ms][i,t,:] .==
                 termos_lo_gap[i,t,:,1] .- termos_lo_gap[i,t,:,2])
         end
     end
-    @constraint(sub, dual_ldr_row(probs, Φ, θ_lo) .- sub[:θ_lo_ms] .== θ_lo_gap[:,1] .- θ_lo_gap[:,2])
+    @constraint(sub, dual_ldr_row(Φ, probs, θ_lo) .- sub[:θ_lo_ms] .== θ_lo_gap[:,1] .- θ_lo_gap[:,2])
     for i in 1:problem.cuts_count
-        @constraint(sub, dual_ldr_row(probs, Φ, cuts_slack[i,:]) .- sub[:cuts_ms][i,:] .==
+        @constraint(sub, dual_ldr_row(Φ, probs, cuts_slack[i,:]) .- sub[:cuts_ms][i,:] .==
             cuts_gap[i,:,1] .- cuts_gap[i,:,2])
     end
 
@@ -1034,7 +1034,7 @@ coupling_moments_flat(mts) =
     [vec(mts.volume_mx); vec(mts.hydro_mx); vec(mts.spill_mx); vec(mts.termos_mx); vec(mts.θ_mx); vec(mts.cuts_mx)]
 
 """
-    add_coupling_moment_bounds!(model, mts, s)
+    add_coupling_moment_bounds!(model, s, mts)
 
 The cheap, necessary bounds every row of `mts` obeys because every basis
 function in this file is nonnegative-valued: the moment of a variable that is
@@ -1049,7 +1049,7 @@ what let the master's objective (`Σ cost·termos_mx[:,:,1] + θ_mx[1]`, both
 terms now bounded below) never be unbounded, unlike `:all`'s master before any
 cut narrowed it down.
 """
-function add_coupling_moment_bounds!(model, mts, s::Sample)
+function add_coupling_moment_bounds!(model, s::Sample, mts)
     (; problem, φ̄) = s
     @constraint(model, mts.volume_mx .>= 0)
     @constraint(model, mts.volume_mx .<= problem.hydro_capacity .* φ̄')
@@ -1117,20 +1117,20 @@ function dual_ldr_coupling_subproblem(s::Sample; solver = HiGHS.Optimizer)
         cuts_gap[1:problem.cuts_count,1:K,1:2] >= 0
     end)
     for t in 1:T
-        @constraint(sub, dual_ldr_row(probs, Φ, volume[t,:]) .- mts.volume_mx[t,:] .==
+        @constraint(sub, dual_ldr_row(Φ, probs, volume[t,:]) .- mts.volume_mx[t,:] .==
             volume_gap[t,:,1] .- volume_gap[t,:,2])
-        @constraint(sub, dual_ldr_row(probs, Φ, hydro[t,:]) .- mts.hydro_mx[t,:] .==
+        @constraint(sub, dual_ldr_row(Φ, probs, hydro[t,:]) .- mts.hydro_mx[t,:] .==
             hydro_gap[t,:,1] .- hydro_gap[t,:,2])
-        @constraint(sub, dual_ldr_row(probs, Φ, spill[t,:]) .- mts.spill_mx[t,:] .==
+        @constraint(sub, dual_ldr_row(Φ, probs, spill[t,:]) .- mts.spill_mx[t,:] .==
             spill_gap[t,:,1] .- spill_gap[t,:,2])
         for i in 1:problem.termo_count
-            @constraint(sub, dual_ldr_row(probs, Φ, termos[i,t,:]) .- mts.termos_mx[i,t,:] .==
+            @constraint(sub, dual_ldr_row(Φ, probs, termos[i,t,:]) .- mts.termos_mx[i,t,:] .==
                 termos_gap[i,t,:,1] .- termos_gap[i,t,:,2])
         end
     end
-    @constraint(sub, dual_ldr_row(probs, Φ, θ) .- mts.θ_mx .== θ_gap[:,1] .- θ_gap[:,2])
+    @constraint(sub, dual_ldr_row(Φ, probs, θ) .- mts.θ_mx .== θ_gap[:,1] .- θ_gap[:,2])
     for i in 1:problem.cuts_count
-        @constraint(sub, dual_ldr_row(probs, Φ, cuts_slack[i,:]) .- mts.cuts_mx[i,:] .==
+        @constraint(sub, dual_ldr_row(Φ, probs, cuts_slack[i,:]) .- mts.cuts_mx[i,:] .==
             cuts_gap[i,:,1] .- cuts_gap[i,:,2])
     end
 
@@ -1207,7 +1207,7 @@ function dual_ldr_benders_loop!(master, coupling, sub; max_iterations, feasibili
             end
             break
         end
-        @constraint(master, 0 >= subproblem_cut(violation, sub, coupling, coupling_value))
+        @constraint(master, 0 >= subproblem_cut(sub, violation, coupling, coupling_value))
         cuts += 1
     end
     return (; Obj = lower, dt, converged, iterations, cuts)
@@ -1285,13 +1285,13 @@ function dual_ldr_benders(
         # five moments are already declared above; only cuts_mx is new here.
         @variable(master, cuts_mx[1:problem.cuts_count,1:K])
         mts = (; volume_mx, hydro_mx, spill_mx, termos_mx, θ_mx, cuts_mx)
-        add_coupling_moment_bounds!(master, mts, s)
+        add_coupling_moment_bounds!(master, s, mts)
         coupling = coupling_moments_flat(mts)
     end
 
     for t in 1:T
         previous = t == 1 ? problem.initial_volume .* φ̄ : volume_mx[t-1,:]
-        @constraint(master, volume_mx[t,:] .- previous .- dual_ldr_row(probs, Φ, inflow[t,:]) .+
+        @constraint(master, volume_mx[t,:] .- previous .- dual_ldr_row(Φ, probs, inflow[t,:]) .+
             hydro_mx[t,:] .+ spill_mx[t,:] .== 0)
         @constraint(master, hydro_mx[t,:] .+ sum(termos_mx[i,t,:] for i in 1:problem.termo_count) .-
             problem.stage_demands[t] .* φ̄ .== 0)
@@ -2003,14 +2003,14 @@ function dual_ldr_restricted_primal(s::Sample, active, constant; solver = HiGHS.
     rows = Matrix{Any}(undef, coupling_row_count(problem, T), K)
     for t in 1:T
         previous = t == 1 ? fill(problem.initial_volume, n_active) : volume[t-1,:]
-        rows[balance_row(T,t),:] = @constraint(model, dual_ldr_row(p, Ψ,
+        rows[balance_row(T,t),:] = @constraint(model, dual_ldr_row(Ψ, p,
             volume[t,:] .- previous .- I[t,:] .+ hydro[t,:] .+ spill[t,:]) .== 0)
-        rows[demand_row(T,t),:] = @constraint(model, dual_ldr_row(p, Ψ,
+        rows[demand_row(T,t),:] = @constraint(model, dual_ldr_row(Ψ, p,
             hydro[t,:] .+ sum(termos[i,t,:] for i in 1:problem.termo_count) .-
             problem.stage_demands[t]) .== 0)
     end
     for i in 1:problem.cuts_count
-        rows[cut_row(T,i),:] = @constraint(model, dual_ldr_row(p, Ψ,
+        rows[cut_row(T,i),:] = @constraint(model, dual_ldr_row(Ψ, p,
             cuts_slack[i,:] .+ problem.cuts_coeff[i] .* volume[T,:] .- θ .+
             problem.cuts_inter[i]) .== 0)
     end
