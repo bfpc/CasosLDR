@@ -41,4 +41,4 @@ Design choices:
 
 Limitations:
 * The `evaluate_first_stage` uses a deterministic SAA model wth 100 uniformly chosen scenarios to evaluate the costs; this is only a Monte-Carlo approximation;
-* The LDR model does not use "cross-stage" breakpoints, which could improve the approximation of the second-stage decisions.
+* "Cross-stage" breakpoints are available via `ldr_solution(problem, n_breakpoints, pw_sum)`: `pw_sum > 0` puts that many breakpoints on `inflow2 + inflow3` (`LDR.Experimental.set_breakpoints`). They improve the primal rule much more than the dual bound.

@@ -8,6 +8,7 @@ using JuMP
 using HiGHS
 using Distributions
 using LinearDecisionRules
+import LinearDecisionRules as LDR
 import SDDP
 
 using Main.Compare
@@ -247,8 +248,19 @@ end
 
 """
 LDR model where stage-2 and stage-3 decisions depend on the stochastic inflows.
+
+- `n_breakpoints`: breakpoints on each inflow (stages 2 and 3), so that the rules
+  are piecewise affine in each inflow separately.
+- `pw_sum`: breakpoints on the total inflow `inflow2 + inflow3`, equally spaced
+  inside its range, so that the stage-3 rules are also piecewise affine in the
+  sum (`LDR.Experimental.set_breakpoints`).
+
+LDR.jl does not let an uncertainty of a combination have `BreakPoints` of its
+own.  When both are asked for, the breakpoints of each inflow are therefore set
+as a one-input combination, `1.0 * inflow`, which gives the same rules and bounds
+as `BreakPoints` (checked for 2 breakpoints: same primal value and dual bound).
 """
-function ldr_solution(problem::HydroProblem, n_breakpoints=0)
+function ldr_solution(problem::HydroProblem, n_breakpoints=0, pw_sum=0)
     ldr = LDRModel(problem.solver)
     set_silent(ldr)
 
@@ -277,9 +289,15 @@ function ldr_solution(problem::HydroProblem, n_breakpoints=0)
     )
 
     # Set breakpoints for uncertainty approximation.
-    if n_breakpoints > 0
+    if n_breakpoints > 0 && pw_sum > 0
+        LDR.Experimental.set_breakpoints(ldr, 1.0 * inflow2, n_breakpoints)
+        LDR.Experimental.set_breakpoints(ldr, 1.0 * inflow3, n_breakpoints)
+    elseif n_breakpoints > 0
         set_attribute(inflow2, BreakPoints(), n_breakpoints)
         set_attribute(inflow3, BreakPoints(), n_breakpoints)
+    end
+    if pw_sum > 0
+        LDR.Experimental.set_breakpoints(ldr, inflow2 + inflow3, pw_sum)
     end
 
     dt = @elapsed optimize!(ldr)
@@ -449,6 +467,8 @@ function compare_methods(
     solvers = [
         "EV" => expected_value_solution
         ["LDR ($n breakpoints)" => p -> ldr_solution(p, n) for n in 0:3]
+        ["LDR (sum, $n breakpoints)" => p -> ldr_solution(p, 0, n) for n in [1, 3, 5]]
+        "PWLDR (2 each + 5 on sum)" => p -> ldr_solution(p, 2, 5)
         ["SAA ($n x 30 samples)" => p -> saa_solution(p, n) for n in sample_sizes]
         ["SDDP ($n x 100 samples)" => p -> sddp_solution(p, [1, n, 100]) for n in sample_sizes]
     ]
